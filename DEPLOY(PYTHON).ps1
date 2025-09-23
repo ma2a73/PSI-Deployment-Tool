@@ -547,6 +547,7 @@ function Install-VPNProfile {
         Write-Host "VPN profile file missing, skipping import."
         return $false
     }
+    Resolve-DnsName -Name "busybee.psi-pac.com" -Server 8.8.8.8
 }
 
 
