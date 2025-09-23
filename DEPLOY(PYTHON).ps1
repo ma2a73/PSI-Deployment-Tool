@@ -291,33 +291,58 @@ function Start-BackgroundInstaller {
 
 function Install-CrowdStrike {
     param(
-        [int]$BackgroundWaitSeconds = 30
+        [string]$InstallerPath = "$PSScriptRoot\WindowsSensor.MaverickGyr.exe",
+        [string]$CID = "47AB920FB2F34F00BEDE8311E34EA489-EB"
     )
 
-    Write-Host "Installing CrowdStrike (launched as background job)..."
-    Start-Sleep -Seconds 2
+    Write-Host "Checking if CrowdStrike is already installed..."
 
-    $installer = Join-Path $folderPath "WindowsSensor.MaverickGyr.exe"
-
-    if (-not (Test-Path $installer)) {
-        Write-Host "CrowdStrike installer not found: $installer"
+    $service = Get-Service -Name "CSFalconService" -ErrorAction SilentlyContinue
+    if ($service) {
+        Write-Host "CrowdStrike is already installed (Service: $($service.Status))"
+        Write-Output $true
         return
     }
 
-    $args = @()
+    $csRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CSFalconService"
+    if (Test-Path $csRegPath) {
+        $imagePath = (Get-ItemProperty -Path $csRegPath -ErrorAction SilentlyContinue).ImagePath
+        Write-Host "CrowdStrike is already installed (Registry entry found: $imagePath)"
+        Write-Output $true
+        return
+    }
 
-    $job = Start-BackgroundInstaller -Path $installer -Arguments $args -WaitSeconds $BackgroundWaitSeconds -FriendlyName "CrowdStrike"
+    if (-not (Test-Path $InstallerPath)) {
+        Write-Host "CrowdStrike installer not found: $InstallerPath"
+        Write-Output $false
+        return
+    }
 
-    if ($job) {
-        try {
-            $jobInfoFile = Join-Path $localLogDirectory "CrowdStrikeInstallJob_$($job.Id).txt"
-            $job | Out-String | Out-File -FilePath $jobInfoFile -Encoding utf8 -Force
-            Write-Host "CrowdStrike background job started (JobId=$($job.Id)). Info saved to $jobInfoFile"
-        } catch {
-            Write-Host "Unable to write job info file: $_"
+    if ([string]::IsNullOrWhiteSpace($CID)) {
+        Write-Host "CID not provided. Silent install requires CID."
+        Write-Output $false
+        return
+    }
+
+    $args = "/install","/quiet","/norestart","CID=$CID"
+    try {
+        Write-Host "Launching CrowdStrike installer..."
+        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $args -PassThru -WindowStyle Hidden -Wait
+        if ($proc -and ($proc.ExitCode -eq 0)) {
+            Write-Host "CrowdStrike installed successfully (ExitCode $($proc.ExitCode))"
+            Write-Output $true
+        } else {
+            $exit = if ($proc) { $proc.ExitCode } else { "unknown" }
+            Write-Host "CrowdStrike installer finished with exit code $exit"
+            Write-Output $false
         }
+    } catch {
+        Write-Host "CrowdStrike installation failed: $_"
+        Write-Output $false
     }
 }
+
+
 
 function Install-Vantage {
     param (
@@ -602,17 +627,8 @@ Enable-RDP
 Install-TeamViewer
 $adobeJob = Install-AdobeReader
 Enable-DotNetFramework
-if (Install-CrowdStrike) { 
-Write-Host "CrowdStrike finished, continuing..." 
-} else {
- Write-Host "CrowdStrike failed, continuing anyway..." 
- }
-if ($installVANTAGE){ 
-Install-Vantage 
-}
-else { 
-Write-Host "Vantage installation bypassed" -ForegroundColor Cyan 
-}
+if (Install-CrowdStrike) { Write-Host "CrowdStrike finished, continuing..." } else { Write-Host "CrowdStrike failed, continuing anyway..." }
+if ($installVANTAGE) { Install-Vantage } else { Write-Host "Vantage installation bypassed" -ForegroundColor Cyan }
 Remove-Office365
 if ($installVPN) {
     if (Install-VPN) {
@@ -641,3 +657,4 @@ try {
     Write-Host "Error while collecting background job outputs: $_"
 }
 Stop-Transcript
+
