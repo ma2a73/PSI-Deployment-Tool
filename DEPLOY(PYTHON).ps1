@@ -536,7 +536,7 @@ function Install-VPNProfile {
     $vpnProfile = Join-Path $PSScriptRoot "PSI-PAC VPN.vpn"
     if (Test-Path $vpnProfile) {
         try {
-            Start-Process -FilePath $vpnProfile -WindowStyle Hidden -Wait
+            Start-Process -FilePath $vpnProfile -WindowStyle Hidden
             Write-Host "VPN profile imported successfully."
             return $true
         } catch {
