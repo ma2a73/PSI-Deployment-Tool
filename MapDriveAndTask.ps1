@@ -14,7 +14,7 @@ if ($MyInvocation.MyCommand.Path -ne $targetScriptPath) {
     }
 }
 
-$runKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $scriptName = "MapSharedDrive"
 
 try {
@@ -23,12 +23,12 @@ try {
     if (-not $existingValue) {
         Set-ItemProperty -Path $runKey -Name $scriptName `
             -Value "PowerShell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$targetScriptPath`" -Location `"$Location`""
-        Write-Host "Registry Run key added for $scriptName in HKLM"
+        Write-Host "Registry Run key added for $scriptName in HKCU"
     } else {
-        Write-Host "Registry Run key already exists in HKLM. Skipping."
+        Write-Host "Registry Run key already exists in HKCU. Skipping."
     }
 } catch {
-    Write-Host "Failed to add or check Run key in HKLM: $_"
+    Write-Host "Failed to add or check Run key in HKCU: $_"
 }
 
 function Map-SharedDrive {
