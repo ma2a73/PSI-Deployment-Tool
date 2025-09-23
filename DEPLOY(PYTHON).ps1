@@ -133,53 +133,41 @@ function Rename-ComputerPrompt {
 }
 
 function Map-SharedDriveCall {
-    $mapScript = Join-Path $PSScriptRoot "MapDriveAndTask.ps1"
-    if (-not (Test-Path $mapScript)) {
-        Write-Host "MapDriveAndTask.ps1 not found at $mapScript"
-        return
-    }
-
-    $targetScriptPath = "$env:LOCALAPPDATA\MapDriveAndTask.ps1"
-
-    try {
-        Copy-Item -Path $mapScript -Destination $targetScriptPath -Force
-        Write-Host "Copied MapDrive script to $targetScriptPath"
-    } catch {
-        Write-Host "Failed to copy MapDrive script: $_"
-        return
-    }
+    param([string]$Location)
 
     $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
     $scriptName = "MapSharedDrive"
 
-    try {
-        $existingValue = Get-ItemProperty -Path $runKey -Name $scriptName -ErrorAction SilentlyContinue
+    $remotePath = switch ($Location.ToUpper()) {
+        "GEORGIA"  { "\\GA-DC02\Shared2" }
+        "ARKANSAS" { "\\AR-DC\Shared" }
+        "IDAHO"    { "\\ID-DC\IDShared" }
+        Default    { "\\GA-DC02\Shared2" }
+    }
 
-        if (-not $existingValue) {
-            $registryCommand = "PowerShell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& '$targetScriptPath' -Location '$location' 2>`$null | Out-Null`""
-            
-            Set-ItemProperty -Path $runKey -Name $scriptName -Value $registryCommand
-            Write-Host "Registry Run key added for $scriptName (Silent mode)"
-        } else {
-            Write-Host "Registry Run key already exists. Skipping."
+    $userMarker = Join-Path $env:LOCALAPPDATA "SDriveMapped.txt"
+
+    $inlineCommand = {
+        if (-not (Test-Path $userMarker)) {
+            if (-not (Get-SmbMapping -LocalPath "S:" -ErrorAction SilentlyContinue)) {
+                New-SmbMapping -LocalPath "S:" -RemotePath $using:remotePath -Persistent $true
+            }
+            New-Item -Path $userMarker -ItemType File -Force | Out-Null
+        }
+    }
+
+    try {
+        if (-not (Get-ItemProperty -Path $runKey -Name $scriptName -ErrorAction SilentlyContinue)) {
+            $regCommand = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& { $($inlineCommand.ToString()) }`""
+            Set-ItemProperty -Path $runKey -Name $scriptName -Value $regCommand
         }
     } catch {
-        Write-Host "Failed to add or check Run key: $_"
+        Write-Host "Failed to set Run key for MapSharedDrive: $_"
     }
 
-    try {
-        Start-Process -FilePath "PowerShell.exe" -ArgumentList @(
-            "-NoProfile", 
-            "-WindowStyle", "Hidden", 
-            "-ExecutionPolicy", "Bypass", 
-            "-Command", 
-            "& '$targetScriptPath' -Location '$location' 2>`$null | Out-Null"
-        ) -WindowStyle Hidden -Wait:$false
-        Write-Host "Drive mapping script executed silently"
-    } catch {
-        Write-Host "Failed to execute drive mapping script: $_"
-    }
+    & $inlineCommand
 }
+
 
 function Switch-Logs {
     $remoteLogDir = "\\ga-dc02\Shared2\New I.T\PC Deployment Tool - Version 1.33\DEPLOY LOGS"
@@ -622,7 +610,7 @@ function Run-WindowsUpdates {
 Set-TimeZoneFromUserInput
 Join-DomainBasedOnLocation
 Rename-ComputerPrompt
-Map-SharedDriveCall
+Map-SharedDriveCall -Location $location
 Switch-Logs
 Enable-RDP
 Install-TeamViewer
