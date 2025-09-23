@@ -1,5 +1,4 @@
-﻿# PYTHON MODIFIED VERSION - FOR USE WITH PYINSTALLER-BUNDLED PYTHON EXE 9/3/2025 2:28PM EST
-param(
+﻿param(
     [string]$timezone,
     [string]$location,
     [string]$computerName,
@@ -30,8 +29,6 @@ $key = Get-Content -Path $keyPath -Encoding Byte
 $encrypted = Get-Content -Path $encryptedPath -Raw
 $securePassword = $encrypted | ConvertTo-SecureString -Key $key
 $Credential = New-Object System.Management.Automation.PSCredential("PSI-PAC\Support", $securePassword)
-
-# ------------------- FUNCTIONS -------------------
 
 function Set-TimeZoneFromUserInput {
     switch ($timezone.ToUpper()) {
@@ -93,14 +90,12 @@ function Run-Installer {
 
     Write-Host "Running installer: $Path"
 
-    # Ensure $Arguments is an array and remove null/empty entries
     if ($null -eq $Arguments) { $Arguments = @() }
     $safeArgs = @()
     foreach ($a in $Arguments) {
         if ($a -ne $null -and $a -ne "") { $safeArgs += $a }
     }
 
-    # Start process with or without ArgumentList depending on whether we have args
     if ($safeArgs.Count -gt 0) {
         $process = Start-Process -FilePath $Path -ArgumentList $safeArgs -PassThru -WindowStyle Hidden
     } else {
@@ -124,7 +119,6 @@ function Run-Installer {
     Get-Process -Name $processName -ErrorAction SilentlyContinue | ForEach-Object { $_.Kill() }
 }
 
-
 function Rename-ComputerPrompt {
     if ([string]::IsNullOrWhiteSpace($computerName)) {
         Write-Host "Computer name not provided."
@@ -140,40 +134,52 @@ function Rename-ComputerPrompt {
 
 function Map-SharedDriveCall {
     $mapScript = Join-Path $PSScriptRoot "MapDriveAndTask.ps1"
-    if (Test-Path $mapScript) {
+    if (-not (Test-Path $mapScript)) {
+        Write-Host "MapDriveAndTask.ps1 not found at $mapScript"
+        return
+    }
 
-        $targetScriptPath = "$env:LOCALAPPDATA\MapDriveAndTask.ps1"
+    $targetScriptPath = "$env:LOCALAPPDATA\MapDriveAndTask.ps1"
 
-        if ($MyInvocation.MyCommand.Path -ne $targetScriptPath) {
-            try {
-                Copy-Item -Path $mapScript -Destination $targetScriptPath -Force
-                Write-Host "Copied MapDrive script to $targetScriptPath"
-            } catch {
-                Write-Host "Failed to copy MapDrive script: $_"
-            }
+    try {
+        Copy-Item -Path $mapScript -Destination $targetScriptPath -Force
+        Write-Host "Copied MapDrive script to $targetScriptPath"
+    } catch {
+        Write-Host "Failed to copy MapDrive script: $_"
+        return
+    }
+
+    $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    $scriptName = "MapSharedDrive"
+
+    try {
+        $existingValue = Get-ItemProperty -Path $runKey -Name $scriptName -ErrorAction SilentlyContinue
+
+        if (-not $existingValue) {
+            $registryCommand = "PowerShell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& '$targetScriptPath' -Location '$location' 2>`$null | Out-Null`""
+            
+            Set-ItemProperty -Path $runKey -Name $scriptName -Value $registryCommand
+            Write-Host "Registry Run key added for $scriptName (Silent mode)"
+        } else {
+            Write-Host "Registry Run key already exists. Skipping."
         }
+    } catch {
+        Write-Host "Failed to add or check Run key: $_"
+    }
 
-        $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-        $scriptName = "MapSharedDrive"
-
-        try {
-            $existingValue = Get-ItemProperty -Path $runKey -Name $scriptName -ErrorAction SilentlyContinue
-
-            if (-not $existingValue) {
-                Set-ItemProperty -Path $runKey -Name $scriptName `
-                    -Value "PowerShell.exe -NoProfile -WindowStyle Hidden -File `"$targetScriptPath`" -Location `"$location`""
-                Write-Host "Registry Run key added for $scriptName"
-            } else {
-                Write-Host "Registry Run key already exists. Skipping."
-            }
-        } catch {
-            Write-Host "Failed to add or check Run key: $_"
-        }
-
-        & powershell.exe -ExecutionPolicy Bypass -File $targetScriptPath -Location $location
+    try {
+        Start-Process -FilePath "PowerShell.exe" -ArgumentList @(
+            "-NoProfile", 
+            "-WindowStyle", "Hidden", 
+            "-ExecutionPolicy", "Bypass", 
+            "-Command", 
+            "& '$targetScriptPath' -Location '$location' 2>`$null | Out-Null"
+        ) -WindowStyle Hidden -Wait:$false
+        Write-Host "Drive mapping script executed silently"
+    } catch {
+        Write-Host "Failed to execute drive mapping script: $_"
     }
 }
-
 
 function Switch-Logs {
     $remoteLogDir = "\\ga-dc02\Shared2\New I.T\PC Deployment Tool - Version 1.33\DEPLOY LOGS"
@@ -215,6 +221,7 @@ function Enable-DotNetFramework {
 }
 
 function Install-TeamViewer {
+    Write-Host "Installing TeamViewer"
     & "$folderPath\Teamviewer_Setup.exe" /i /qn /S
 }
 
@@ -282,7 +289,6 @@ function Start-BackgroundInstaller {
     return $job
 }
 
-
 function Install-CrowdStrike {
     param(
         [int]$BackgroundWaitSeconds = 30
@@ -298,7 +304,7 @@ function Install-CrowdStrike {
         return
     }
 
-    $args = @()  # add silent args here if required
+    $args = @()
 
     $job = Start-BackgroundInstaller -Path $installer -Arguments $args -WaitSeconds $BackgroundWaitSeconds -FriendlyName "CrowdStrike"
 
@@ -314,18 +320,39 @@ function Install-CrowdStrike {
 }
 
 function Install-Vantage {
-    $batPath = Join-Path $folderPath "client803.bat"
-    $targetPath = "C:\Client803"
+    param (
+        [string]$location
+    )
+
+    $batPath       = Join-Path $folderPath "client803.bat"
+    $targetPath    = "C:\client803"
     $sourceClientFolder = Join-Path $folderPath "client803_source" 
-    $defaultTotalFiles = 17023
+    $defaultTotalFiles  = 17023
+
+    switch ($location.ToUpper()) {
+        "Georgia" { 
+            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+        }
+        "Arkansas" { 
+            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+        }
+        "Idaho" { 
+            $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803\client803"
+            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+        }
+        default { 
+            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+        }
+    }
 
     if (Test-Path $sourceClientFolder) {
         try {
             $totalFiles = (Get-ChildItem -Path $sourceClientFolder -Recurse -File -ErrorAction Stop).Count
             if (-not $totalFiles -or $totalFiles -le 0) { $totalFiles = $defaultTotalFiles }
-        } catch {
-            $totalFiles = $defaultTotalFiles
-        }
+        } catch { $totalFiles = $defaultTotalFiles }
     } else {
         $totalFiles = $defaultTotalFiles
     }
@@ -336,7 +363,7 @@ function Install-Vantage {
         return
     }
 
-    $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$batPath`"" -PassThru -WindowStyle Hidden
+    $process = Start-Process -FilePath $batPath -ArgumentList $location -PassThru -WindowStyle Hidden
     $lastReportedPercent = -1
     $noChangeCounter = 0
     $lastCount = -1
@@ -345,39 +372,24 @@ function Install-Vantage {
 
     while ($true) {
         if ($process -and $process.HasExited) { $process = $null }
-
         if (Test-Path $targetPath) {
-            try {
-                $currentCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
-            } catch {
-                $currentCount = 0
-            }
-
+            try { $currentCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count } catch { $currentCount = 0 }
             $percent = 0
             if ($totalFiles -gt 0) {
                 $percent = [math]::Round(( [double]$currentCount / [double]$totalFiles) * 100)
                 if ($percent -lt 0) { $percent = 0 }
                 if ($percent -gt 100) { $percent = 100 }
             }
-
             if ($percent -ne $lastReportedPercent) {
                 Write-Output "vantage progress: $percent"
                 $lastReportedPercent = $percent
                 $noChangeCounter = 0
             } else {
-                if ($lastCount -eq $currentCount) {
-                    $noChangeCounter += $sleepInterval
-                } else {
-                    $noChangeCounter = 0
-                }
+                if ($lastCount -eq $currentCount) { $noChangeCounter += $sleepInterval } else { $noChangeCounter = 0 }
             }
-
             $lastCount = $currentCount
-
             if ($noChangeCounter -ge $stabilitySecondsRequired) {
-                if ($lastReportedPercent -lt 100) {
-                    Write-Output "vantage progress: 100"
-                }
+                if ($lastReportedPercent -lt 100) { Write-Output "vantage progress: 100" }
                 break
             }
         } else {
@@ -386,23 +398,16 @@ function Install-Vantage {
                 $lastReportedPercent = 0
             }
         }
-
         Start-Sleep -Seconds $sleepInterval
     }
 
     if (Test-Path $targetPath) {
         $finalCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
-        if ($finalCount -gt 0) {
-            Write-Output "vantage progress: 100"
-        }
-    } else {
-        Write-Output "vantage progress: 100"
-    }
+        if ($finalCount -gt 0) { Write-Output "vantage progress: 100" }
+    } else { Write-Output "vantage progress: 100" }
 
-    $Password = ConvertTo-SecureString "Password!" -AsPlainText -Force
-    $Cred = New-Object System.Management.Automation.PSCredential("Vantage_User", $Password)
-
-    Copy-Item -Path "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk" -Destination "C:\Users\Public\Desktop" -Force
+    $desktopPath = "$env:PUBLIC\Desktop"
+    if (Test-Path $remoteShortcut) { Copy-Item -Path $remoteShortcut -Destination $desktopPath -Force }
 
     $installSteps = @(
         @{ Path = "$folderPath\Microsoft WSE 3.0 Runtime.msi"; Percent = 90 },
@@ -413,20 +418,10 @@ function Install-Vantage {
     foreach ($step in $installSteps) {
         if (Test-Path $step.Path) {
             $ext = [System.IO.Path]::GetExtension($step.Path).ToLower()
-            $args = switch ($ext) {
-                ".msi" { "/quiet /norestart" }
-                ".exe" { "/quiet /norestart" }
-                default { "/quiet /norestart" }
-            }
+            $args = switch ($ext) { ".msi" { "/quiet /norestart" } ".exe" { "/quiet /norestart" } default { "/quiet /norestart" } }
             Start-Process -FilePath $step.Path -ArgumentList $args -Wait -WindowStyle Hidden
             Write-Output "vantage progress: $($step.Percent)"
         }
-    }
-
-    $shortcutPath = "S:\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
-    $desktopPath = "$env:PUBLIC\Desktop"
-    if (Test-Path $shortcutPath) {
-        Copy-Item -Path $shortcutPath -Destination $desktopPath -Force
     }
 
     Write-Output "vantage progress: 100"
@@ -444,58 +439,91 @@ function Remove-Office365 {
     }
 }
 
-function Run-AdobeInstaller {
-    param (
-        [string]$Path,
-        [string[]]$Arguments = @("/sAll","/rs","/rps","/msi","/norestart","/quiet","EULA_ACCEPT=YES"),
-        [int]$TimeoutSeconds = 600
-    )
-
-    if (-not (Test-Path $Path)) {
-        Write-Host "Adobe installer not found: $Path"
-        return
-    }
-
-    Write-Host "Running Adobe installer: $Path"
-
-    $proc = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru -WindowStyle Hidden
-
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-
-    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        $adobeRunning = Get-Process -Name "AcroPro*" -ErrorAction SilentlyContinue
-        if (-not $proc.HasExited -or $adobeRunning) {
-            Start-Sleep -Seconds 5
-        } else {
-            break
-        }
-    }
-
-    $adobeRunning = Get-Process -Name "AcroPro*" -ErrorAction SilentlyContinue
-    if ($adobeRunning) {
-        Write-Host "Adobe install exceeded timeout. Killing Acrobat processes..."
-        $adobeRunning | ForEach-Object { try { $_.Kill() } catch {} }
-    }
-
-    if ($proc.HasExited) {
-        Write-Host "Adobe installer completed successfully."
-    } else {
-        Write-Host "Adobe installer forced to close after timeout."
-    }
-}
-
 function Install-AdobeReader {
     $installer = "$folderPath\Adobe Acrobat.exe"
-    $desktopPath = "C:\Users\$env:USERNAME\Desktop"
-    Copy-Item -Path $installer -Destination $desktopPath -Force
-
-    Run-AdobeInstaller -Path "$desktopPath\Adobe Acrobat.exe"
+    
+    if (-not (Test-Path $installer)) {
+        Write-Host "Adobe installer not found: $installer"
+        return $null
+    }
+    
+    Write-Host "Starting Adobe Reader installation as background job..."
+    
+    $job = Start-Job -Name "AdobeInstallJob" -ScriptBlock {
+        param($installerPath)
+        
+        $silentArgs = @(
+            "/S",
+            "/v/qn", 
+            "/norestart",
+            "EULA_ACCEPT=YES",
+            "SUPPRESS_APP_LAUNCH=YES",
+            "DISABLE_BROWSER_INTEGRATION=YES"
+        )
+        
+        try {
+            Write-Output "Starting Adobe installation..."
+            $process = Start-Process -FilePath $installerPath -ArgumentList $silentArgs -WindowStyle Hidden -PassThru
+            
+            $completed = $process.WaitForExit(600000)
+            
+            if (-not $completed) {
+                Write-Output "Adobe installer timed out after 10 minutes - terminating"
+                try { $process.Kill() } catch { }
+                return "Adobe installation timed out"
+            } else {
+                Write-Output "Adobe installation completed successfully"
+                return "Adobe installation finished"
+            }
+        } catch {
+            Write-Output "Adobe installer error: $_"
+            return "Adobe installation failed: $_"
+        }
+    } -ArgumentList $installer
+    
+    Write-Host "Adobe Reader installation started in background (Job ID: $($job.Id))"
+    Write-Host "Script will continue while Adobe installs..."
+    
+    return $job
 }
-
 
 function Install-VPN {
-    Start-Process -FilePath "$folderPath\silent.bat" -WorkingDirectory $folderPath -Wait -WindowStyle Hidden
+    $vpnInstaller = Join-Path $PSScriptRoot "silent.bat"
+
+    if (-not (Test-Path $vpnInstaller)) {
+        Write-Host "VPN installer not found at $vpnInstaller"
+        return $false
+    }
+
+    try {
+        Write-Host "Installing Barracuda VPN client..."
+        Start-Process -FilePath $vpnInstaller -WorkingDirectory $PSScriptRoot -Wait -WindowStyle Hidden
+        Write-Host "Barracuda VPN installation completed."
+        return $true
+    }
+    catch {
+        Write-Host "Unable to install Barracuda VPN"
+        return $false
+    }
 }
+
+function Install-VPNProfile {
+    $vpnProfile = Join-Path $PSScriptRoot "PSI-PAC VPN.vpn"
+    if (Test-Path $vpnProfile) {
+        try {
+            Start-Process -FilePath $vpnProfile -WindowStyle Hidden -Wait
+            Write-Host "VPN profile imported successfully."
+            return $true
+        } catch {
+            Write-Host "Failed to import VPN profile: $_"
+            return $false
+        }
+    } else {
+        Write-Host "VPN profile file missing, skipping import."
+        return $false
+    }
+}
+
 
 function Install-Office365 {
     $installer = "$folderPath\OfficeSetup.exe"
@@ -565,8 +593,6 @@ function Run-WindowsUpdates {
     }
 }
 
-# ------------------- MAIN EXECUTION -------------------
-
 Set-TimeZoneFromUserInput
 Join-DomainBasedOnLocation
 Rename-ComputerPrompt
@@ -574,33 +600,37 @@ Map-SharedDriveCall
 Switch-Logs
 Enable-RDP
 Install-TeamViewer
-Install-AdobeReader
-# Launch CrowdStrike in background and continue
-Install-CrowdStrike -BackgroundWaitSeconds 30
+$adobeJob = Install-AdobeReader
 Enable-DotNetFramework
-if ($installVANTAGE) {
-    Install-Vantage
+if (Install-CrowdStrike) { 
+Write-Host "CrowdStrike finished, continuing..." 
 } else {
-    Write-Host "Vantage installation bypassed" -ForegroundColor Cyan
+ Write-Host "CrowdStrike failed, continuing anyway..." 
+ }
+if ($installVANTAGE){ 
+Install-Vantage 
 }
-
+else { 
+Write-Host "Vantage installation bypassed" -ForegroundColor Cyan 
+}
 Remove-Office365
-
 if ($installVPN) {
-    Install-VPN
+    if (Install-VPN) {
+        Start-Sleep -Seconds 5
+        Install-VPNProfile
+    } else {
+        Write-Host "Skipping VPN profile import since installation failed."
+    }
 } else {
     Write-Host "Barracuda VPN install bypassed" -ForegroundColor Cyan
 }
-
 Install-Office365
 Verify-Installations
 Run-WindowsUpdates
-
-
 try {
-    $bgJobs = Get-Job | Where-Object { $_.Name -like 'InstallJob_*' }
+    $bgJobs = Get-Job | Where-Object { $_.Name -like 'InstallJob_*' -or $_.Name -like 'AdobeInstallJob' }
     foreach ($j in $bgJobs) {
-        if ($j.State -eq 'Completed' -or $j.State -eq 'Failed' -or $j.State -eq 'Stopped') {
+        if ($j.State -in 'Completed','Failed','Stopped') {
             Write-Host "Collecting output for background job Id=$($j.Id) Name=$($j.Name) State=$($j.State)"
             Receive-Job -Job $j -Wait -AutoRemoveJob | ForEach-Object { Write-Host "[BG JOB $($j.Id)] $_" }
         } else {
@@ -610,5 +640,4 @@ try {
 } catch {
     Write-Host "Error while collecting background job outputs: $_"
 }
-
 Stop-Transcript
