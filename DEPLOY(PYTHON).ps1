@@ -132,11 +132,9 @@ function Rename-ComputerPrompt {
     }
 }
 
-function Map-SharedDriveCall {
-    param([string]$Location)
-
-    $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-    $scriptName = "MapSharedDrive"
+function Install-SharedDriveTask {
+    param(
+        [string]$Location)
 
     $remotePath = switch ($Location.ToUpper()) {
         "GEORGIA"  { "\\GA-DC02\Shared2" }
@@ -145,28 +143,15 @@ function Map-SharedDriveCall {
         Default    { "\\GA-DC02\Shared2" }
     }
 
-    $userMarker = Join-Path $env:LOCALAPPDATA "SDriveMapped.txt"
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"if (-not (Get-SmbMapping -LocalPath S: -ErrorAction SilentlyContinue)) { New-SmbMapping -LocalPath S: -RemotePath '$remotePath' -Persistent $true }`""
 
-    $inlineCommand = {
-        if (-not (Test-Path $userMarker)) {
-            if (-not (Get-SmbMapping -LocalPath "S:" -ErrorAction SilentlyContinue)) {
-                New-SmbMapping -LocalPath "S:" -RemotePath $using:remotePath -Persistent $true
-            }
-            New-Item -Path $userMarker -ItemType File -Force | Out-Null
-        }
-    }
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
 
-    try {
-        if (-not (Get-ItemProperty -Path $runKey -Name $scriptName -ErrorAction SilentlyContinue)) {
-            $regCommand = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& { $($inlineCommand.ToString()) }`""
-            Set-ItemProperty -Path $runKey -Name $scriptName -Value $regCommand
-        }
-    } catch {
-        Write-Host "Failed to set Run key for MapSharedDrive: $_"
-    }
+    $principal = New-ScheduledTaskPrincipal -GroupId "Users" -RunLevel Limited
 
-    & $inlineCommand
+    Register-ScheduledTask -TaskName "MapSharedDrive" -Action $action -Trigger $trigger -Principal $principal -Force
 }
+
 
 
 function Switch-Logs {
@@ -610,7 +595,7 @@ function Run-WindowsUpdates {
 Set-TimeZoneFromUserInput
 Join-DomainBasedOnLocation
 Rename-ComputerPrompt
-Map-SharedDriveCall -Location $location
+Install-SharedDriveTask
 Switch-Logs
 Enable-RDP
 Install-TeamViewer
