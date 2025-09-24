@@ -134,7 +134,8 @@ function Rename-ComputerPrompt {
 
 function Install-SharedDriveTask {
     param(
-        [string]$Location)
+        [string]$Location
+    )
 
     $remotePath = switch ($Location.ToUpper()) {
         "GEORGIA"  { "\\GA-DC02\Shared2" }
@@ -143,7 +144,18 @@ function Install-SharedDriveTask {
         Default    { "\\GA-DC02\Shared2" }
     }
 
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"if (-not (Get-SmbMapping -LocalPath S: -ErrorAction SilentlyContinue)) { New-SmbMapping -LocalPath S: -RemotePath '$remotePath' -Persistent $true }`""
+    $scriptBlock = @"
+if (-not (Test-Path "`$env:LOCALAPPDATA\SDriveMapped.txt")) {
+    if (-not (Get-SmbMapping -LocalPath S: -ErrorAction SilentlyContinue)) {
+        New-SmbMapping -LocalPath S: -RemotePath '$remotePath' -Persistent \$true
+    }
+    New-Item -Path "`$env:LOCALAPPDATA\SDriveMapped.txt" -ItemType File -Force | Out-Null
+} else {
+    exit
+}
+"@
+
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `$scriptBlock"
 
     $trigger = New-ScheduledTaskTrigger -AtLogOn
 
@@ -151,6 +163,7 @@ function Install-SharedDriveTask {
 
     Register-ScheduledTask -TaskName "MapSharedDrive" -Action $action -Trigger $trigger -Principal $principal -Force
 }
+
 
 
 
