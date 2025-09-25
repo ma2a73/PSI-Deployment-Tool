@@ -321,8 +321,6 @@ function Install-CrowdStrike {
     }
 }
 
-
-
 function Install-Vantage {
     param (
         [string]$location
@@ -334,15 +332,15 @@ function Install-Vantage {
     $defaultTotalFiles  = 17023
 
     switch ($location.ToUpper()) {
-        "Georgia" { 
+        "GEORGIA" { 
             $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
         }
-        "Arkansas" { 
+        "ARKANSAS" { 
             $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
         }
-        "Idaho" { 
+        "IDAHO" { 
             $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
         }
@@ -367,7 +365,17 @@ function Install-Vantage {
         return
     }
 
-    $process = Start-Process -FilePath $batPath -ArgumentList $location -PassThru -WindowStyle Hidden
+    $startProcessParams = @{
+        FilePath = $batPath
+        PassThru = $true
+        WindowStyle = 'Hidden'
+    }
+    
+    if (-not [string]::IsNullOrWhiteSpace($location)) {
+        $startProcessParams.ArgumentList = $location
+    }
+    
+    $process = Start-Process @startProcessParams
     $lastReportedPercent = -1
     $noChangeCounter = 0
     $lastCount = -1
@@ -416,14 +424,18 @@ function Install-Vantage {
     $installSteps = @(
         @{ Path = "$folderPath\Microsoft WSE 3.0 Runtime.msi"; Percent = 90 },
         @{ Path = "$folderPath\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95 },
-        @{ Path = "$folderPath\dotNetFx35Setup.exe"; Percent = 98 }
-        @{ Path = "$folderpath\sqlncli.msi"; Percent = 99 }
+        @{ Path = "$folderPath\dotNetFx35Setup.exe"; Percent = 98 },
+        @{ Path = "$folderPath\sqlncli.msi"; Percent = 99 }
     )
 
     foreach ($step in $installSteps) {
         if (Test-Path $step.Path) {
             $ext = [System.IO.Path]::GetExtension($step.Path).ToLower()
-            $args = switch ($ext) { ".msi" { "/quiet /norestart" } ".exe" { "/quiet /norestart" } default { "/quiet /norestart" } }
+            $args = switch ($ext) { 
+                ".msi" { "/quiet /norestart" } 
+                ".exe" { "/quiet /norestart" } 
+                default { "/quiet /norestart" } 
+            }
             Start-Process -FilePath $step.Path -ArgumentList $args -Wait -WindowStyle Hidden
             Write-Output "vantage progress: $($step.Percent)"
         }
