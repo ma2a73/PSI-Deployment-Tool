@@ -144,28 +144,29 @@ function Install-SharedDriveTask {
         Default    { "\\GA-DC02\Shared2" }
     }
 
-    $scriptBlock = {
-        param($remotePath)
+    $scriptBlock = @"
+param([string]`$remotePath)
 
-        if (-not (Test-Path "$env:LOCALAPPDATA\SDriveMapped.txt")) {
-            if (-not (Get-SmbMapping -LocalPath S: -ErrorAction SilentlyContinue)) {
-                New-SmbMapping -LocalPath S: -RemotePath $remotePath -Persistent $true
-            }
-            New-Item -Path "$env:LOCALAPPDATA\SDriveMapped.txt" -ItemType File -Force | Out-Null
-        }
-        else {
-            exit
-        }
+if (-not (Test-Path "`$env:LOCALAPPDATA\SDriveMapped.txt")) {
+    if (-not (Get-SmbMapping -LocalPath S: -ErrorAction SilentlyContinue)) {
+        New-SmbMapping -LocalPath S: -RemotePath "`$remotePath" -Persistent `$true
     }
+    New-Item -Path "`$env:LOCALAPPDATA\SDriveMapped.txt" -ItemType File -Force | Out-Null
+}
+else {
+    exit
+}
+"@
 
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"& { param(`$remotePath) $($scriptBlock) } -remotePath '$remotePath'`""
+        -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"& { $scriptBlock } -remotePath '$remotePath'`""
 
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $principal = New-ScheduledTaskPrincipal -GroupId "Users" -RunLevel Limited
 
     Register-ScheduledTask -TaskName "MapSharedDrive" -Action $action -Trigger $trigger -Principal $principal -Force
 }
+
 
 
 function Switch-Logs {
