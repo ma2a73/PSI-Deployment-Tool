@@ -424,6 +424,7 @@ function Install-Vantage {
         @{ Path = "$folderPath\Microsoft WSE 3.0 Runtime.msi"; Percent = 90 },
         @{ Path = "$folderPath\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95 },
         @{ Path = "$folderPath\dotNetFx35Setup.exe"; Percent = 98 }
+        @{ Path = "$folderpath\sqlncli.msi"; Percent = 99 }
     )
 
     foreach ($step in $installSteps) {
