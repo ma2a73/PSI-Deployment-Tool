@@ -628,56 +628,60 @@ function Remove-Office365 {
     }
 }
 
-
 function Install-AdobeReader {
     $msiPath = Join-Path $PSScriptRoot "AcroRead.msi"
     $mstPath = Join-Path $PSScriptRoot "AcroRead.mst"
     $mspPath = Join-Path $PSScriptRoot "AcroRdrDCUpd2500120693.msp"
     $cabPath = Join-Path $PSScriptRoot "Data1.cab"
-    
+
     if (-not (Test-Path $msiPath)) { Write-Host "MSI not found: $msiPath"; return $false }
     if (-not (Test-Path $mstPath)) { Write-Host "MST not found: $mstPath"; return $false }
     if (-not (Test-Path $mspPath)) { Write-Host "MSP not found: $mspPath"; return $false }
     if (-not (Test-Path $cabPath)) { Write-Host "CAB not found: $cabPath"; return $false }
-    
+
     Write-Host "All Adobe Reader files found. Starting installation..."
-    
+
     Push-Location $PSScriptRoot
-    
     try {
+        $baseLog = Join-Path $env:TEMP "AdobeReader_Base.log"
         $baseArgs = @(
             "/i", "`"AcroRead.msi`"",
             "TRANSFORMS=`"AcroRead.mst`"",
-            "/qn", "/norestart"
+            "/qn", "/norestart",
+            "/l*v", "`"$baseLog`""
         )
-        
+
         Write-Host "Installing Adobe Reader base with transform..."
         $baseProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $baseArgs -Wait -PassThru
-        
+
         if ($baseProcess.ExitCode -ne 0) {
             Write-Host "Base installation failed with exit code: $($baseProcess.ExitCode)"
+            Write-Host "See log: $baseLog"
             return $false
         }
-        
+
         Write-Host "Base installation successful. Applying patch..."
         Start-Sleep -Seconds 5
-        
+
+        $patchLog = Join-Path $env:TEMP "AdobeReader_Patch.log"
         $patchArgs = @(
             "/p", "`"AcroRdrDCUpd2500120693.msp`"",
-            "/qn", "/norestart"
+            "/qn", "/norestart",
+            "/l*v", "`"$patchLog`""
         )
-        
+
         $patchProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -Wait -PassThru
-        
-        if ($baseProcess.ExitCode -eq 0) {
+
+        if ($patchProcess.ExitCode -eq 0) {
             Write-Host "Adobe Reader installation and patch complete"
             return $true
         } else {
-            Write-Host "Installation completed but patch may have failed"
-            return $true
+            Write-Host "Patch failed with exit code: $($patchProcess.ExitCode)"
+            Write-Host "See log: $patchLog"
+            return $false
         }
-        
-    } finally {
+    }
+    finally {
         Pop-Location
     }
 }
