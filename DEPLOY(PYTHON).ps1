@@ -618,44 +618,56 @@ function Remove-Office365 {
             }
         }
         
+        Write-Host "Downloading Microsoft Office Scrub Tool (SaRACmd)..." -ForegroundColor Yellow
+        
         $saraUrls = @(
-            "https://aka.ms/SaRA_EnterpriseVersionFiles",
+            "https://download.microsoft.com/download/f/2/a/f2ae0064-8778-4d1a-9a4b-c3c3ec1779d3/SaRACmd_17_01_3658_000.zip",
             "https://download.microsoft.com/download/13eaffaa-0961-4a6a-863b-26d1f8b0ca15/SaRACmd_17_01_3309_000.zip"
         )
         $saraZip = "$env:TEMP\SaRACmd.zip"
-        $saraPath = "$env:TEMP\SaRACmd\SaRACmd.exe"
+        $saraExtracted = $false
         
         foreach ($url in $saraUrls) {
             try {
-                Write-Host "Downloading SaRACmd from: $url" -ForegroundColor Yellow
+                Write-Host "Downloading from: $url" -ForegroundColor Yellow
                 Invoke-WebRequest -Uri $url -OutFile $saraZip -UseBasicParsing -ErrorAction Stop
-                Write-Host "Extracting SaRACmd..." -ForegroundColor Yellow
+                
+                Write-Host "Extracting SaRACmd archive..." -ForegroundColor Yellow
                 if (Test-Path "$env:TEMP\SaRACmd") { Remove-Item "$env:TEMP\SaRACmd" -Recurse -Force }
                 Expand-Archive -Path $saraZip -DestinationPath "$env:TEMP\SaRACmd" -Force -ErrorAction Stop
-                break
+                
+                $saraPath = Get-ChildItem -Path "$env:TEMP\SaRACmd" -Name "SaRACmd.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($saraPath) {
+                    $saraFullPath = (Get-ChildItem -Path "$env:TEMP\SaRACmd" -Name "SaRACmd.exe" -Recurse | Select-Object -First 1).FullName
+                    Write-Host "Found SaRACmd at: $saraFullPath" -ForegroundColor Green
+                    
+                    Write-Host "Running Microsoft Office Scrub Tool..." -ForegroundColor Green
+                    $saraArgs = "-S OfficeScrubScenario -AcceptEula -OfficeVersion All"
+                    $process = Start-Process -FilePath $saraFullPath -ArgumentList $saraArgs -Wait -PassThru -WindowStyle Hidden
+                    $exitCode = $process.ExitCode
+                    Write-Host "SaRACmd completed with exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { "Green" } else { "Red" })
+                    
+                    switch ($exitCode) {
+                        0 { Write-Host "SUCCESS: Office removal completed successfully!" -ForegroundColor Green }
+                        1 { Write-Host "WARNING: General failure in Office removal - continuing with other methods..." -ForegroundColor Yellow }
+                        6 { Write-Host "WARNING: Office programs were running - continuing with other methods..." -ForegroundColor Yellow }
+                        68 { Write-Host "INFO: No Office version found by SaRACmd - continuing with other methods..." -ForegroundColor Cyan }
+                        default { Write-Host "WARNING: Unknown exit code $exitCode - continuing with other methods..." -ForegroundColor Yellow }
+                    }
+                    $saraExtracted = $true
+                    break
+                } else {
+                    Write-Host "SaRACmd.exe not found in extracted files" -ForegroundColor Red
+                }
             }
             catch { 
-                Write-Host "Failed to download from $url, trying next..." -ForegroundColor Red
+                Write-Host "Failed to download/extract from $url - Error: $($_.Exception.Message)" -ForegroundColor Red
                 continue 
             }
         }
         
-        if (Test-Path $saraPath) {
-            Write-Host "Running Microsoft Office Scrub Tool..." -ForegroundColor Green
-            $saraArgs = "-S OfficeScrubScenario -AcceptEula -OfficeVersion All"
-            $process = Start-Process -FilePath $saraPath -ArgumentList $saraArgs -Wait -PassThru -WindowStyle Hidden
-            $exitCode = $process.ExitCode
-            Write-Host "SaRACmd completed with exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { "Green" } else { "Red" })
-            
-            switch ($exitCode) {
-                0 { Write-Host "Successfully completed Office removal" -ForegroundColor Green }
-                1 { Write-Host "General failure in Office removal" -ForegroundColor Red }
-                6 { Write-Host "Office programs were running - trying again..." -ForegroundColor Yellow }
-                68 { Write-Host "No Office version found by SaRACmd" -ForegroundColor Yellow }
-                default { Write-Host "Unknown exit code: $exitCode" -ForegroundColor Red }
-            }
-        } else {
-            Write-Host "Failed to download SaRACmd, continuing with manual removal..." -ForegroundColor Red
+        if (-not $saraExtracted) {
+            Write-Host "Could not download/run SaRACmd - continuing with other removal methods..." -ForegroundColor Yellow
         }
         
         Write-Host "Removing UWP Office apps..." -ForegroundColor Cyan
