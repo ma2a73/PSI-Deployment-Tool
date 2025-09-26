@@ -6,7 +6,6 @@ param(
     [switch]$installVANTAGE
 )
 
-# Create local log directory
 $localLogDirectory = "C:\Logs"
 if (-not (Test-Path $localLogDirectory)) {
     New-Item -Path $localLogDirectory -ItemType Directory -Force | Out-Null
@@ -19,12 +18,10 @@ $localLogPath = Join-Path $localLogDirectory $logFileName
 
 Start-Transcript -Path $localLogPath -NoClobber
 
-# Validate parameters
 if (-not $timezone) { throw "Timezone parameter is null or empty." } else { Write-Host "Received Timezone: $timezone" }
 if (-not $location) { throw "Location parameter is null or empty." } else { Write-Host "Received Location: $location" }
 if (-not $computerName) { throw "Computer name is null or empty." } else { Write-Host "Received Computer Name: $computerName" }
 
-# Enhanced credential loading function
 function Get-DomainCredential {
     param([string]$ScriptDirectory = $PSScriptRoot)
     
@@ -32,14 +29,12 @@ function Get-DomainCredential {
         Write-Host "=== CREDENTIAL LOADING ==="
         Write-Host "Script directory: $ScriptDirectory"
         
-        # Look for credential files in current script directory (where Python copied them)
         $keyPath = Join-Path $ScriptDirectory "key.key"
         $encryptedPath = Join-Path $ScriptDirectory "encrypted.txt"
         
         Write-Host "Looking for key file: $keyPath"
         Write-Host "Looking for encrypted file: $encryptedPath"
         
-        # Validate key file
         if (-not (Test-Path $keyPath)) {
             Write-Host "credential_error: key.key file not found at $keyPath"
             Write-Host "Available files in directory:"
@@ -47,7 +42,6 @@ function Get-DomainCredential {
             return $null
         }
         
-        # Validate encrypted file
         if (-not (Test-Path $encryptedPath)) {
             Write-Host "credential_error: encrypted.txt file not found at $encryptedPath"
             Write-Host "Available files in directory:"
@@ -55,7 +49,6 @@ function Get-DomainCredential {
             return $null
         }
         
-        # Check file sizes
         $keySize = (Get-Item $keyPath).Length
         $encryptedSize = (Get-Item $encryptedPath).Length
         
@@ -72,7 +65,6 @@ function Get-DomainCredential {
             return $null
         }
         
-        # Load the files
         Write-Host "Loading credential files..."
         $key = Get-Content -Path $keyPath -Encoding Byte -ErrorAction Stop
         $encrypted = Get-Content -Path $encryptedPath -Raw -ErrorAction Stop
@@ -320,10 +312,8 @@ function Enable-SystemFeatures {
     try {
         Write-Host "Enabling Windows features..."
         
-        # Enable SMB1 Protocol for network shares
         Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
         
-        # Enable Remote Desktop
         Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
         
@@ -602,15 +592,42 @@ function Install-Vantage {
 
 function Remove-Office365 {
     try {
-        Write-Host "Removing existing Office 365 applications"
-        $office = Get-WmiObject -Class Win32_Product | Where-Object { $_.Vendor -eq "Microsoft Corporation" } | Out-Null
-        $office.Uninstall()
-        Get-AppxPackage -Name "Microsoft.Office.Desktop" | Remove-AppPackage | Out-Null
+        Write-Host "=== Removing Office 365 and related components ==="
+
+        Get-AppxPackage -Name "*Office*" -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        Get-AppxPackage -Name "Microsoft.Office.Desktop*" -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        Get-AppxPackage -Name "Microsoft.OfficeHub" -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+
+        $odtConfig = @"
+<Configuration>
+  <Remove All="TRUE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+</Configuration>
+"@
+        $configPath = "$env:TEMP\RemoveOffice.xml"
+        $odtPath    = "$env:TEMP\setup.exe"
+
+        if (-not (Test-Path $odtPath)) {
+            Invoke-WebRequest -Uri "https://download.microsoft.com/download/2/6/E/26E0FABB-2A0A-45D3-9F05-7CF88E0D2F0C/officedeploymenttool.exe" -OutFile "$env:TEMP\odt.exe"
+            Start-Process "$env:TEMP\odt.exe" -ArgumentList "/quiet /extract:$env:TEMP" -Wait
+        }
+
+        $odtConfig | Out-File -FilePath $configPath -Encoding ASCII
+        Start-Process -FilePath $odtPath -ArgumentList "/configure $configPath" -Wait
+
+        $msiOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "Office" -or $_.Name -match "Microsoft 365" }
+        foreach ($app in $msiOffice) {
+            Write-Host "Uninstalling MSI Office: $($app.Name)"
+            $app.Uninstall() | Out-Null
+        }
+
+        Write-Host "Office 365 removal complete. Reboot recommended."
     }
     catch {
-        Write-Host "Unable to locate existing Office 365 applications"
+        Write-Host "Error during Office removal: $_"
     }
 }
+
 
 function Install-AdobeReader {
     $msiPath = Join-Path $PSScriptRoot "AcroRead.msi"
@@ -788,7 +805,6 @@ function Run-WindowsUpdates {
     }
 }
 
-# === MAIN EXECUTION ===
 Write-Host "=== PSI DEPLOYMENT TOOL STARTING ==="
 Write-Host "Loading domain credentials..."
 
@@ -802,26 +818,20 @@ if ($Credential) {
     Write-Host "Domain join and computer rename will be skipped"
 }
 
-# Execute deployment steps
 Set-TimeZoneFromUserInput
 
-# Join domain with enhanced error handling
 $domainJoined = Join-DomainBasedOnLocation -Location $location -Credential $Credential
 
-# Rename computer with enhanced error handling
 $computerRenamed = Rename-ComputerPrompt -ComputerName $computerName -Credential $Credential
 
-# Continue with system configuration
 Install-SharedDriveTask -Location $location
 Switch-Logs
 Enable-RDP
 
-# System configuration (sequential instead of parallel)
 Write-Host "=== SYSTEM CONFIGURATION ==="
 Enable-SystemFeatures
 Enable-DotNetFramework
 
-# Install applications
 Install-TeamViewer
 Install-AdobeReader
 
@@ -853,7 +863,6 @@ Install-Office365
 Verify-Installations
 Run-WindowsUpdates
 
-# Clean up background jobs
 try {
     $bgJobs = Get-Job | Where-Object { $_.Name -like 'InstallJob_*' -or $_.Name -like 'AdobeInstallJob' }
     foreach ($j in $bgJobs) {
@@ -869,3 +878,4 @@ try {
 }
 
 Stop-Transcript
+
