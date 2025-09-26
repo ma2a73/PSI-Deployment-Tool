@@ -594,7 +594,7 @@ function Remove-Office365 {
     try {
         $procList = "winword","excel","powerpnt","outlook","onenote","msaccess","mspub","lync","teams","onenotem","onenoteim","officeclicktorun","msteams","skype"
         Get-Process -Name $procList -ErrorAction SilentlyContinue | Stop-Process -Force
-
+        
         $services = "ClickToRunSvc","OfficeSvc","OfficeClickToRun"
         foreach ($svc in $services) {
             if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
@@ -602,7 +602,28 @@ function Remove-Office365 {
                 Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
             }
         }
-
+        
+        $saraUrls = @(
+            "https://aka.ms/SaRA_EnterpriseVersionFiles",
+            "https://download.microsoft.com/download/13eaffaa-0961-4a6a-863b-26d1f8b0ca15/SaRACmd_17_01_3309_000.zip"
+        )
+        $saraZip = "$env:TEMP\SaRACmd.zip"
+        $saraPath = "$env:TEMP\SaRACmd\SaRACmd.exe"
+        
+        foreach ($url in $saraUrls) {
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $saraZip -UseBasicParsing -ErrorAction Stop
+                Expand-Archive -Path $saraZip -DestinationPath "$env:TEMP\SaRACmd" -Force -ErrorAction Stop
+                break
+            }
+            catch { continue }
+        }
+        
+        if (Test-Path $saraPath) {
+            $saraArgs = "-S OfficeScrubScenario -AcceptEula -OfficeVersion All"
+            Start-Process -FilePath $saraPath -ArgumentList $saraArgs -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+        }
+        
         $appxPatterns = @(
             "Microsoft.Office*",
             "Microsoft.MicrosoftOfficeHub",
@@ -615,7 +636,7 @@ function Remove-Office365 {
             Get-AppxPackage -Name $pattern -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
             Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $pattern } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
         }
-
+        
         $odtConfig = @"
 <Configuration>
   <Remove All="TRUE" />
@@ -625,18 +646,20 @@ function Remove-Office365 {
         $configPath = "$env:TEMP\RemoveOffice.xml"
         $odtPath    = "$env:TEMP\setup.exe"
         $odtDownloadUrl = "https://download.microsoft.com/download/2/6/E/26E0FABB-2A0A-45D3-9F05-7CF88E0D2F0C/officedeploymenttool_19231-20072.exe"
-
+        
         if (-not (Test-Path $odtPath)) {
-            Invoke-WebRequest -Uri $odtDownloadUrl -OutFile "$env:TEMP\odt.exe" -UseBasicParsing
-            Start-Process "$env:TEMP\odt.exe" -ArgumentList "/quiet /extract:$env:TEMP" -Wait
+            Invoke-WebRequest -Uri $odtDownloadUrl -OutFile "$env:TEMP\odt.exe" -UseBasicParsing -ErrorAction SilentlyContinue
+            Start-Process "$env:TEMP\odt.exe" -ArgumentList "/quiet /extract:$env:TEMP" -Wait -ErrorAction SilentlyContinue
         }
-
-        $odtConfig | Out-File -FilePath $configPath -Encoding ASCII
-        Start-Process -FilePath $odtPath -ArgumentList "/configure $configPath" -Wait
-
+        
+        if (Test-Path $odtPath) {
+            $odtConfig | Out-File -FilePath $configPath -Encoding ASCII
+            Start-Process -FilePath $odtPath -ArgumentList "/configure $configPath" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+        }
+        
         $msiOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "Office" -or $_.Name -match "Microsoft 365" -or $_.Name -match "OneNote" -or $_.Name -match "Skype" -or $_.Name -match "Teams" }
         foreach ($app in $msiOffice) { $app.Uninstall() | Out-Null }
-
+        
         $paths = @(
             "C:\Program Files\Microsoft Office",
             "C:\Program Files (x86)\Microsoft Office",
@@ -656,7 +679,7 @@ function Remove-Office365 {
         foreach ($path in $paths) {
             if (Test-Path $path) { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue }
         }
-
+        
         $regPaths = @(
             "HKLM:\SOFTWARE\Microsoft\Office",
             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office",
