@@ -30,6 +30,8 @@ $encrypted = Get-Content -Path $encryptedPath -Raw
 $securePassword = $encrypted | ConvertTo-SecureString -Key $key
 $Credential = New-Object System.Management.Automation.PSCredential("PSI-PAC\Support", $securePassword)
 
+$jobQueue = @()
+
 function Set-TimeZoneFromUserInput {
     switch ($timezone.ToUpper()) {
         "EASTERN"  { Set-TimeZone "Eastern Standard Time"; Write-Host "Timezone set to Eastern Standard Time" }
@@ -76,47 +78,72 @@ function Join-DomainBasedOnLocation {
     }
 }
 
-function Run-Installer {
+function Start-FastInstaller {
     param (
         [string]$Path,
         [string[]]$Arguments = @(),
-        [int]$TimeoutSeconds = 900
+        [int]$TimeoutSeconds = 600,
+        [string]$FriendlyName = $(Split-Path $Path -Leaf),
+        [switch]$Background
     )
 
     if (-not (Test-Path $Path)) {
-        Write-Host "Installer not found: $Path"
-        return
+        Write-Host "$FriendlyName installer not found: $Path"
+        return $null
     }
 
-    Write-Host "Running installer: $Path"
-
-    if ($null -eq $Arguments) { $Arguments = @() }
     $safeArgs = @()
-    foreach ($a in $Arguments) {
-        if ($a -ne $null -and $a -ne "") { $safeArgs += $a }
+    if ($Arguments) {
+        foreach ($a in $Arguments) {
+            if ($a -and $a.Trim()) { $safeArgs += $a.Trim() }
+        }
     }
 
-    if ($safeArgs.Count -gt 0) {
-        $process = Start-Process -FilePath $Path -ArgumentList $safeArgs -PassThru -WindowStyle Hidden
+    if ($Background) {
+        $job = Start-Job -Name "Install_$FriendlyName" -ScriptBlock {
+            param($FilePath, $Args, $Timeout, $Name)
+            try {
+                if ($Args -and $Args.Count -gt 0) {
+                    $proc = Start-Process -FilePath $FilePath -ArgumentList $Args -PassThru -WindowStyle Hidden
+                } else {
+                    $proc = Start-Process -FilePath $FilePath -PassThru -WindowStyle Hidden
+                }
+                
+                if (-not $proc.WaitForExit($Timeout * 1000)) {
+                    $proc.Kill()
+                    return @{ Success = $false; ExitCode = -1; Message = "$Name timed out" }
+                }
+                
+                return @{ Success = ($proc.ExitCode -eq 0); ExitCode = $proc.ExitCode; Message = "$Name completed" }
+            } catch {
+                return @{ Success = $false; ExitCode = -2; Message = "$Name failed: $_" }
+            }
+        } -ArgumentList $Path, $safeArgs, $TimeoutSeconds, $FriendlyName
+        
+        Write-Host "Started $FriendlyName in background..."
+        return $job
     } else {
-        $process = Start-Process -FilePath $Path -PassThru -WindowStyle Hidden
+        Write-Host "Installing $FriendlyName..."
+        try {
+            if ($safeArgs.Count -gt 0) {
+                $proc = Start-Process -FilePath $Path -ArgumentList $safeArgs -PassThru -WindowStyle Hidden
+            } else {
+                $proc = Start-Process -FilePath $Path -PassThru -WindowStyle Hidden
+            }
+            
+            if ($proc.WaitForExit($TimeoutSeconds * 1000)) {
+                Write-Host "$FriendlyName completed with exit code: $($proc.ExitCode)"
+                return $proc.ExitCode -eq 0
+            } else {
+                Write-Host "$FriendlyName timed out and was terminated"
+                $proc.Kill()
+                return $false
+            }
+        } catch {
+            Write-Host "$FriendlyName failed: $_"
+            return $false
+        }
     }
-
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-
-    while ($process -and -not $process.HasExited -and $sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        Start-Sleep -Seconds 2
-    }
-
-    if ($process -and -not $process.HasExited) {
-        Write-Host "Installer exceeded timeout. Killing process: $Path"
-        try { $process.Kill() } catch {}
-    } else {
-        Write-Host "Installer completed: $Path"
-    }
-
-    $processName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-    Get-Process -Name $processName -ErrorAction SilentlyContinue | ForEach-Object { $_.Kill() }
 }
 
 function Rename-ComputerPrompt {
@@ -133,9 +160,8 @@ function Rename-ComputerPrompt {
 }
 
 function Install-SharedDriveTask {
-    param(
-        [string]$Location
-    )
+    param([string]$Location)
+    
     $remotePath = switch ($Location.ToUpper()) {
         "GEORGIA"  { "\\GA-DC02\Shared2" }
         "ARKANSAS" { "\\AR-DC\Shared" }
@@ -151,121 +177,95 @@ if (-not (Test-Path "`$env:LOCALAPPDATA\SDriveMapped.txt")) {
     New-Item -Path "`$env:LOCALAPPDATA\SDriveMapped.txt" -ItemType File -Force | Out-Null
 }
 "@
-    Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -All -NoRestart
+    
+    try {
+        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -All -NoRestart | Out-Null
+    } catch {
+        Write-Host "SMB1 feature enable failed: $_"
+    }
+    
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$scriptContent`""
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $principal = New-ScheduledTaskPrincipal -GroupId "Users" -RunLevel Limited
     
-    Register-ScheduledTask -TaskName "MapSharedDrive" -Action $action -Trigger $trigger -Principal $principal -Force
+    Register-ScheduledTask -TaskName "MapSharedDrive" -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
 }
-
 
 function Switch-Logs {
     $remoteLogDir = "\\ga-dc02\Shared2\New I.T\PC Deployment Tool - Version 1.33\DEPLOY LOGS"
     $remoteLogPath = Join-Path $remoteLogDir $logFileName
     if (Test-Path $remoteLogDir) {
-        Copy-Item -Path $localLogPath -Destination $remoteLogDir -Force
-        Write-Host "Log file copied to shared location."
-
-        Stop-Transcript
-        Start-Sleep -Seconds 2
-
-        Start-Transcript -Path $remoteLogPath -Append
-        Write-Host "Logging continued on shared drive: $remoteLogPath"
+        try {
+            Copy-Item -Path $localLogPath -Destination $remoteLogDir -Force
+            Write-Host "Log file copied to shared location."
+            Stop-Transcript
+            Start-Sleep -Seconds 1
+            Start-Transcript -Path $remoteLogPath -Append
+            Write-Host "Logging continued on shared drive: $remoteLogPath"
+        } catch {
+            Write-Host "Log switching failed: $_"
+        }
     } else {
         Write-Host "Remote log directory not found. Skipping log copy."
     }
 }
 
-function Enable-RDP {
-    Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-    Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-    Write-Host "Remote Desktop enabled."
+function Enable-SystemFeatures {
+    Write-Host "Configuring system features..."
+    
+    $registryOps = @(
+        @{ Path = "HKLM:\System\CurrentControlSet\Control\Terminal Server"; Name = "fDenyTSConnections"; Value = 0 }
+    )
+    
+    foreach ($op in $registryOps) {
+        try {
+            Set-ItemProperty -Path $op.Path -Name $op.Name -Value $op.Value -Force
+        } catch {
+            Write-Host "Registry operation failed for $($op.Path)\$($op.Name): $_"
+        }
+    }
+    
+    try {
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+        Write-Host "Remote Desktop enabled."
+    } catch {
+        Write-Host "RDP firewall rule failed: $_"
+    }
 }
 
 function Enable-DotNetFramework {
-    try {
-        Write-Host "Enabling .NET Framework 3.5 (includes 2.0 and 3.0)..."
-        
-        $sxsSource = "X:\sources\sxs"
-        if (Test-Path $sxsSource) {
-            Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -LimitAccess -Source $sxsSource -ErrorAction SilentlyContinue
+    Write-Host "Enabling .NET Framework 3.5..."
+    
+    $job = Start-Job -ScriptBlock {
+        try {
+            $sxsSource = "X:\sources\sxs"
+            if (Test-Path $sxsSource) {
+                Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -LimitAccess -Source $sxsSource -ErrorAction SilentlyContinue | Out-Null
+            }
+            DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart /Quiet | Out-Null
+            return "SUCCESS"
+        } catch {
+            return "FAILED: $_"
         }
-
-        DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart /Quiet | Out-Null
-        Write-Host ".NET Framework installation initiated silently."
-    } catch {
-        Write-Host "Failed to enable .NET Framework: $_"
     }
+    
+    if (Wait-Job -Job $job -Timeout 120) {
+        $result = Receive-Job -Job $job
+        Write-Host ".NET Framework operation: $result"
+    } else {
+        Write-Host ".NET Framework operation timed out"
+    }
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
 }
 
 function Install-TeamViewer {
     Write-Host "Installing TeamViewer"
-    & "$folderPath\Teamviewer_Setup.exe" /i /qn /S
-}
-
-function Start-BackgroundInstaller {
-    param(
-        [Parameter(Mandatory=$true)] [string]$Path,
-        [string[]]$Arguments = @(),
-        [int]$WaitSeconds = 30,
-        [string]$FriendlyName = $(Split-Path $Path -Leaf)
-    )
-
-    if (-not (Test-Path $Path)) {
-        Write-Host "$FriendlyName installer not found: $Path"
-        return $null
-    }
-
-    Write-Host "Starting $FriendlyName in background (will wait up to $WaitSeconds seconds for completion)..."
-
-    if ($null -eq $Arguments) { $Arguments = @() }
-    $safeArgs = @()
-    foreach ($a in $Arguments) {
-        if ($a -ne $null -and $a -ne "") { $safeArgs += $a }
-    }
-
-    $job = Start-Job -Name ("InstallJob_" + [System.Guid]::NewGuid().ToString()) -ScriptBlock {
-        param($p, $a, $friendly)
-        try {
-            if ($null -eq $a) { $a = @() }
-            $innerArgs = @()
-            foreach ($x in $a) { if ($x -ne $null -and $x -ne "") { $innerArgs += $x } }
-
-            if ($innerArgs.Count -gt 0) {
-                $proc = Start-Process -FilePath $p -ArgumentList $innerArgs -PassThru -WindowStyle Hidden
-            } else {
-                $proc = Start-Process -FilePath $p -PassThru -WindowStyle Hidden
-            }
-
-            if ($proc) {
-                $proc | Wait-Process
-                Write-Output "${friendly}: process finished"
-            } else {
-                Write-Output "${friendly}: Start-Process returned no process object"
-            }
-        } catch {
-            Write-Output "${friendly}: installer job error: $_"
-        }
-    } -ArgumentList $Path, $safeArgs, $FriendlyName
-
-    $completed = $false
-    if ($WaitSeconds -gt 0) {
-        $completed = Wait-Job -Job $job -Timeout $WaitSeconds
+    $tvPath = Join-Path $folderPath "Teamviewer_Setup.exe"
+    if (Test-Path $tvPath) {
+        Start-FastInstaller -Path $tvPath -Arguments @("/S") -FriendlyName "TeamViewer" -TimeoutSeconds 300
     } else {
-        $completed = $false
+        Write-Host "TeamViewer installer not found"
     }
-
-    if ($completed) {
-        $output = Receive-Job -Job $job -Keep
-        Write-Host "$FriendlyName background job completed within timeout."
-        if ($output) { $output | ForEach-Object { Write-Host $_ } }
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-    } else {
-        Write-Host "$FriendlyName still running in background (did not finish within $WaitSeconds seconds). Continuing with the rest of the script."
-    }
-
-    return $job
 }
 
 function Install-CrowdStrike {
@@ -276,76 +276,46 @@ function Install-CrowdStrike {
 
     Write-Host "Checking if CrowdStrike is already installed..."
 
-    $service = Get-Service -Name "CSFalconService" -ErrorAction SilentlyContinue
-    if ($service) {
-        Write-Host "CrowdStrike is already installed (Service: $($service.Status))"
-        Write-Output $true
-        return
-    }
-
-    $csRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CSFalconService"
-    if (Test-Path $csRegPath) {
-        $imagePath = (Get-ItemProperty -Path $csRegPath -ErrorAction SilentlyContinue).ImagePath
-        Write-Host "CrowdStrike is already installed (Registry entry found: $imagePath)"
-        Write-Output $true
-        return
+    if ((Get-Service -Name "CSFalconService" -ErrorAction SilentlyContinue) -or 
+        (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\CSFalconService")) {
+        Write-Host "CrowdStrike is already installed"
+        return $true
     }
 
     if (-not (Test-Path $InstallerPath)) {
         Write-Host "CrowdStrike installer not found: $InstallerPath"
-        Write-Output $false
-        return
+        return $false
     }
 
     if ([string]::IsNullOrWhiteSpace($CID)) {
         Write-Host "CID not provided. Silent install requires CID."
-        Write-Output $false
-        return
+        return $false
     }
 
-    $args = "/install","/quiet","/norestart","CID=$CID"
-    try {
-        Write-Host "Launching CrowdStrike installer..."
-        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $args -PassThru -WindowStyle Hidden -Wait
-        if ($proc -and ($proc.ExitCode -eq 0)) {
-            Write-Host "CrowdStrike installed successfully (ExitCode $($proc.ExitCode))"
-            Write-Output $true
-        } else {
-            $exit = if ($proc) { $proc.ExitCode } else { "unknown" }
-            Write-Host "CrowdStrike installer finished with exit code $exit"
-            Write-Output $false
-        }
-    } catch {
-        Write-Host "CrowdStrike installation failed: $_"
-        Write-Output $false
-    }
+    Write-Host "Launching CrowdStrike installer..."
+    $args = @("/install", "/quiet", "/norestart", "CID=$CID")
+    return Start-FastInstaller -Path $InstallerPath -Arguments $args -FriendlyName "CrowdStrike" -TimeoutSeconds 300
 }
 
 function Install-Vantage {
-    param (
-        [string]$location
-    )
+    param([string]$location)
 
-    $batPath       = Join-Path $folderPath "client803.bat"
-    $targetPath    = "C:\client803"
+    $batPath = Join-Path $folderPath "client803.bat"
+    $targetPath = "C:\client803"
     $sourceClientFolder = Join-Path $folderPath "client803_source" 
-    $defaultTotalFiles  = 17023
+    $defaultTotalFiles = 17023
 
     switch ($location.ToUpper()) {
         "GEORGIA" { 
-            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
         }
         "ARKANSAS" { 
-            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
         }
         "IDAHO" { 
-            $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
         }
         default { 
-            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
         }
     }
@@ -377,32 +347,33 @@ function Install-Vantage {
     
     $process = Start-Process @startProcessParams
     $lastReportedPercent = -1
-    $noChangeCounter = 0
-    $lastCount = -1
-    $stabilitySecondsRequired = 8
-    $sleepInterval = 1
+    $checkInterval = 2
+    $stabilityRequired = 6
 
-    while ($true) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalMinutes -lt 30) {
         if ($process -and $process.HasExited) { $process = $null }
+        
         if (Test-Path $targetPath) {
-            try { $currentCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count } catch { $currentCount = 0 }
-            $percent = 0
-            if ($totalFiles -gt 0) {
-                $percent = [math]::Round(( [double]$currentCount / [double]$totalFiles) * 100)
-                if ($percent -lt 0) { $percent = 0 }
-                if ($percent -gt 100) { $percent = 100 }
+            try { 
+                $currentCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count 
+            } catch { 
+                $currentCount = 0 
             }
+            
+            $percent = if ($totalFiles -gt 0) { 
+                [math]::Min(100, [math]::Max(0, [math]::Round(($currentCount / $totalFiles) * 100)))
+            } else { 0 }
+            
             if ($percent -ne $lastReportedPercent) {
                 Write-Output "vantage progress: $percent"
                 $lastReportedPercent = $percent
-                $noChangeCounter = 0
+                $stableCount = 0
             } else {
-                if ($lastCount -eq $currentCount) { $noChangeCounter += $sleepInterval } else { $noChangeCounter = 0 }
-            }
-            $lastCount = $currentCount
-            if ($noChangeCounter -ge $stabilitySecondsRequired) {
-                if ($lastReportedPercent -lt 100) { Write-Output "vantage progress: 100" }
-                break
+                $stableCount++
+                if ($stableCount -ge $stabilityRequired -and $percent -eq 100) {
+                    break
+                }
             }
         } else {
             if ($lastReportedPercent -ne 0) {
@@ -410,33 +381,31 @@ function Install-Vantage {
                 $lastReportedPercent = 0
             }
         }
-        Start-Sleep -Seconds $sleepInterval
+        Start-Sleep -Seconds $checkInterval
     }
 
-    if (Test-Path $targetPath) {
-        $finalCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
-        if ($finalCount -gt 0) { Write-Output "vantage progress: 100" }
-    } else { Write-Output "vantage progress: 100" }
+    if ($lastReportedPercent -lt 100) { 
+        Write-Output "vantage progress: 100" 
+    }
 
-    $desktopPath = "$env:PUBLIC\Desktop"
-    if (Test-Path $remoteShortcut) { Copy-Item -Path $remoteShortcut -Destination $desktopPath -Force }
+    if (Test-Path $remoteShortcut) { 
+        try {
+            Copy-Item -Path $remoteShortcut -Destination "$env:PUBLIC\Desktop" -Force 
+        } catch {
+            Write-Host "Failed to copy Vantage shortcut: $_"
+        }
+    }
 
     $installSteps = @(
-        @{ Path = "$folderPath\Microsoft WSE 3.0 Runtime.msi"; Percent = 90 },
-        @{ Path = "$folderPath\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95 },
-        @{ Path = "$folderPath\dotNetFx35Setup.exe"; Percent = 98 },
-        @{ Path = "$folderPath\sqlncli.msi"; Percent = 99 }
+        @{ Path = "$folderPath\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Args = @("/qn", "/norestart") },
+        @{ Path = "$folderPath\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95; Args = @("/qn", "/norestart") },
+        @{ Path = "$folderPath\dotNetFx35Setup.exe"; Percent = 98; Args = @("/qn", "/norestart") },
+        @{ Path = "$folderPath\sqlncli.msi"; Percent = 99; Args = @("/qn", "/norestart") }
     )
 
     foreach ($step in $installSteps) {
         if (Test-Path $step.Path) {
-            $ext = [System.IO.Path]::GetExtension($step.Path).ToLower()
-            $args = switch ($ext) { 
-                ".msi" { "/quiet /norestart" } 
-                ".exe" { "/quiet /norestart" } 
-                default { "/quiet /norestart" } 
-            }
-            Start-Process -FilePath $step.Path -ArgumentList $args -Wait -WindowStyle Hidden
+            Start-FastInstaller -Path $step.Path -Arguments $step.Args -FriendlyName (Split-Path $step.Path -Leaf) -TimeoutSeconds 180
             Write-Output "vantage progress: $($step.Percent)"
         }
     }
@@ -445,17 +414,25 @@ function Install-Vantage {
 }
 
 function Remove-Office365 {
+    Write-Host "Checking for existing Office 365..."
     try {
-        Write-Host "Removing existing Office 365 applications"
-        $office = Get-WmiObject -Class Win32_Product | Where-Object { $_.Vendor -eq "Microsoft Corporation" } | Out-Null
-        $office.Uninstall()
-        Get-AppxPackage -Name "Microsoft.Office.Desktop" | Remove-AppPackage | Out-Null
-    }
-    catch {
-        Write-Host "Unable to locate existing Office 365 applications"
+        $officeApps = Get-AppxPackage -Name "*Office*" -ErrorAction SilentlyContinue
+        if ($officeApps) {
+            Write-Host "Removing Office UWP apps..."
+            $officeApps | Remove-AppxPackage -ErrorAction SilentlyContinue
+        }
+        
+        $officeMSI = Get-WmiObject -Class Win32_Product -ErrorAction SilentlyContinue | Where-Object { 
+            $_.Vendor -eq "Microsoft Corporation" -and $_.Name -like "*Office*" 
+        }
+        if ($officeMSI) {
+            Write-Host "Found MSI Office installation, removing..."
+            $officeMSI | ForEach-Object { $_.Uninstall() | Out-Null }
+        }
+    } catch {
+        Write-Host "Office removal completed with warnings: $_"
     }
 }
-
 
 function Install-AdobeReader {
     $msiPath = Join-Path $folderPath "AcroRead.msi"
@@ -463,24 +440,28 @@ function Install-AdobeReader {
     $mspPath = Join-Path $folderPath "AcroRdrDCUpd2500120693.msp"
     $cabPath = Join-Path $folderPath "Data1.cab"
     
-    if (-not (Test-Path $msiPath)) { Write-Host "MSI not found: $msiPath"; return $false }
-    if (-not (Test-Path $mstPath)) { Write-Host "MST not found: $mstPath"; return $false }
-    if (-not (Test-Path $mspPath)) { Write-Host "MSP not found: $mspPath"; return $false }
-    if (-not (Test-Path $cabPath)) { Write-Host "CAB not found: $cabPath"; return $false }
+    $requiredFiles = @($msiPath, $mstPath, $mspPath, $cabPath)
+    foreach ($file in $requiredFiles) {
+        if (-not (Test-Path $file)) { 
+            Write-Host "Adobe file not found: $(Split-Path $file -Leaf)"
+            return $false 
+        }
+    }
     
     Write-Host "All Adobe Reader files found. Starting installation..."
     
     Push-Location $folderPath
-    
     try {
-        $baseArgs = @(
-            "/i", "`"AcroRead.msi`"",
-            "TRANSFORMS=`"AcroRead.mst`"",
-            "/qn", "/norestart"
-        )
+        $baseArgs = @("/i", "`"AcroRead.msi`"", "TRANSFORMS=`"AcroRead.mst`"", "/qn", "/norestart")
         
         Write-Host "Installing Adobe Reader base with transform..."
-        $baseProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $baseArgs -Wait -PassThru
+        $baseProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $baseArgs -PassThru -WindowStyle Hidden
+        
+        if (-not $baseProcess.WaitForExit(300000)) {
+            $baseProcess.Kill()
+            Write-Host "Adobe base installation timed out"
+            return $false
+        }
         
         if ($baseProcess.ExitCode -ne 0) {
             Write-Host "Base installation failed with exit code: $($baseProcess.ExitCode)"
@@ -488,28 +469,23 @@ function Install-AdobeReader {
         }
         
         Write-Host "Base installation successful. Applying patch..."
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds 3
         
-        $patchArgs = @(
-            "/p", "`"AcroRdrDCUpd2500120693.msp`"",
-            "/qn", "/norestart"
-        )
+        $patchArgs = @("/p", "`"AcroRdrDCUpd2500120693.msp`"", "/qn", "/norestart")
+        $patchProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -PassThru -WindowStyle Hidden
         
-        $patchProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -Wait -PassThru
-        
-        if ($baseProcess.ExitCode -eq 0) {
-            Write-Host "Adobe Reader installation and patch complete"
-            return $true
+        if ($patchProcess.WaitForExit(180000)) {
+            Write-Host "Adobe Reader installation and patch complete (patch exit code: $($patchProcess.ExitCode))"
         } else {
-            Write-Host "Installation completed but patch may have failed"
-            return $true
+            Write-Host "Patch installation timed out but base install succeeded"
         }
+        
+        return $true
         
     } finally {
         Pop-Location
     }
 }
-
 
 function Install-VPN {
     $vpnInstaller = Join-Path $PSScriptRoot "silent.bat"
@@ -519,16 +495,8 @@ function Install-VPN {
         return $false
     }
 
-    try {
-        Write-Host "Installing Barracuda VPN client..."
-        Start-Process -FilePath $vpnInstaller -WorkingDirectory $PSScriptRoot -Wait -WindowStyle Hidden
-        Write-Host "Barracuda VPN installation completed."
-        return $true
-    }
-    catch {
-        Write-Host "Unable to install Barracuda VPN"
-        return $false
-    }
+    Write-Host "Installing Barracuda VPN client..."
+    return Start-FastInstaller -Path $vpnInstaller -FriendlyName "Barracuda VPN" -TimeoutSeconds 300
 }
 
 function Install-VPNProfile {
@@ -546,12 +514,6 @@ function Install-VPNProfile {
         Write-Host "VPN profile file missing, skipping import."
         return $false
     }
-    try {
-    Resolve-DnsName -Name "busybee.psi-pac.com" -Server 8.8.8.8 | Select-Object -Property Name, IPAddress
-    }
-    catch {
-    Write-Host "Unable to resolve busybee.psi-pac.com DNS"
-    }
 }
 
 function Install-Office365 {
@@ -561,92 +523,156 @@ function Install-Office365 {
     if (-not (Test-Path $setupPath)) { Write-Host "Setup file not found: $setupPath"; return $false }
     if (-not (Test-Path $configPath)) { Write-Host "Configuration file not found: $configPath"; return $false }
     
-    $args = @(
-        "/configure", "`"$configPath`""
-    )
     Write-Host "Installing Office 365..."
-    Run-Installer -Path $setupPath -Arguments $args -TimeoutSeconds 1800
-    
-    Write-Host "Office 365 installation complete."
-    return $true
+    $args = @("/configure", "`"$configPath`"")
+    return Start-FastInstaller -Path $setupPath -Arguments $args -FriendlyName "Office 365" -TimeoutSeconds 1800
 }
 
-function Verify-Installations {
-    $reported = @{
-        TeamViewer = $false
-        Adobe      = $false
-        Office365  = $false
-    }
-
-    Start-Job -ScriptBlock {
-        param($reported)
-
-        while ($true) {
-            if (-not $reported.TeamViewer -and (Test-Path "C:\Program Files (x86)\TeamViewer")) {
-                Write-Host "TeamViewer installed"
-                $reported.TeamViewer = $true
-            }
-
-            if (-not $reported.Adobe -and (Test-Path "HKLM:\SOFTWARE\Adobe")) {
-                Write-Host "Adobe Acrobat installed"
-                $reported.Adobe = $true
-            }
-
-            if (-not $reported.Office365) {
+function Start-VerificationJobs {
+    $verifyJob = Start-Job -ScriptBlock {
+        $checks = @{
+            TeamViewer = { Test-Path "C:\Program Files (x86)\TeamViewer" }
+            Adobe = { Test-Path "HKLM:\SOFTWARE\Adobe" }
+            Office365 = { 
                 $office = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
                           Where-Object { $_.DisplayName -like "*Microsoft 365*" -or $_.DisplayName -like "*Office*" }
-                if ($office) {
-                    Write-Host "Office 365 installed"
-                    $reported.Office365 = $true
+                return $office -ne $null
+            }
+        }
+        
+        $reported = @{}
+        $timeout = 300
+        $elapsed = 0
+        
+        while ($elapsed -lt $timeout) {
+            foreach ($name in $checks.Keys) {
+                if (-not $reported[$name] -and (& $checks[$name])) {
+                    Write-Output "$name installed"
+                    $reported[$name] = $true
                 }
             }
-
-            if ($reported.Values -notcontains $false) {
-                break
-            }
-
-            Start-Sleep -Seconds 15
+            
+            if ($reported.Count -eq $checks.Count) { break }
+            Start-Sleep -Seconds 10
+            $elapsed += 10
         }
-    } -ArgumentList $reported | Out-Null
+        
+        return $reported
+    }
+    
+    return $verifyJob
 }
 
 function Run-WindowsUpdates {
+    Write-Host "Starting optimized Windows Updates..."
+    Write-Output "winupdate progress: 0"
+    
     try {
-        Write-Output "winupdate progress: 0"
-
-        Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
-        Install-Module -Name PSWindowsUpdate -SkipPublisherCheck -Force -Scope CurrentUser | Out-Null
-        Import-Module PSWindowsUpdate -Force
-
-        $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Confirm:$false
-        $total = $updates.Count
-        $count = 0
-
-        foreach ($update in $updates) {
-            $count++
-            $percent = [math]::Round(($count / $total) * 100)
-            Write-Output "winupdate progress: $percent"
-            Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -Verbose | Out-Null
+        $job = Start-Job -ScriptBlock {
+            try {
+                Write-Output "winupdate progress: 5"
+                
+                if (-not (Get-Module -Name PSWindowsUpdate -ListAvailable)) {
+                    Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -Confirm:$false | Out-Null
+                    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -Confirm:$false -AllowClobber | Out-Null
+                    Write-Output "winupdate progress: 15"
+                }
+                
+                Import-Module PSWindowsUpdate -Force
+                Write-Output "winupdate progress: 20"
+                
+                $updates = Get-WindowsUpdate -MicrosoftUpdate -IgnoreReboot -AcceptAll
+                $totalUpdates = $updates.Count
+                
+                if ($totalUpdates -eq 0) {
+                    Write-Output "winupdate progress: 100"
+                    Write-Output "winupdate complete"
+                    return
+                }
+                
+                Write-Output "winupdate progress: 30"
+                
+                $installParams = @{
+                    MicrosoftUpdate = $true
+                    AcceptAll = $true
+                    IgnoreReboot = $true
+                    Confirm = $false
+                    ForceDownload = $true
+                    ForceInstall = $true
+                }
+                
+                $progressStep = 70 / $totalUpdates
+                $currentProgress = 30
+                
+                Install-WindowsUpdate @installParams -Verbose | ForEach-Object {
+                    $currentProgress += $progressStep
+                    $roundedProgress = [math]::Min(100, [math]::Round($currentProgress))
+                    Write-Output "winupdate progress: $roundedProgress"
+                }
+                
+                Write-Output "winupdate progress: 100"
+                Write-Output "winupdate complete"
+                
+            } catch {
+                Write-Output "winupdate error: $_"
+            }
         }
-        Write-Output "winupdate complete"
+        
+        $timeout = 1800
+        if (Wait-Job -Job $job -Timeout $timeout) {
+            Receive-Job -Job $job | ForEach-Object { Write-Output $_ }
+        } else {
+            Write-Output "winupdate error: Updates timed out after $timeout seconds"
+            Stop-Job -Job $job
+        }
+        
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        
     } catch {
         Write-Output "winupdate error: $_"
     }
 }
 
+Write-Host "=== OPTIMIZED PSI DEPLOYMENT STARTING ==="
+
 Set-TimeZoneFromUserInput
 Join-DomainBasedOnLocation
 Rename-ComputerPrompt
-Install-SharedDriveTask
+Install-SharedDriveTask -Location $location
 Switch-Logs
-Enable-RDP
+
+Write-Host "=== PARALLEL SYSTEM CONFIGURATION ==="
+$systemJobs = @()
+
+$systemJobs += Start-Job -Name "EnableFeatures" -ScriptBlock {
+    Enable-SystemFeatures
+}
+
+$systemJobs += Start-Job -Name "DotNet" -ScriptBlock {
+    Enable-DotNetFramework
+}
+
+foreach ($job in $systemJobs) {
+    if (Wait-Job -Job $job -Timeout 60) {
+        Receive-Job -Job $job | ForEach-Object { Write-Host "[SYSTEM] $_" }
+    }
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "=== CORE SOFTWARE INSTALLATION ==="
 Install-TeamViewer
 Install-AdobeReader
-Enable-DotNetFramework
-if (Install-CrowdStrike) { Write-Host "CrowdStrike finished, continuing..." } else { Write-Host "CrowdStrike failed, continuing anyway..." }
+
+if (Install-CrowdStrike) { 
+    Write-Host "CrowdStrike finished, continuing..." 
+} else { 
+    Write-Host "CrowdStrike failed, continuing anyway..." 
+}
+
+Write-Host "=== OPTIONAL SOFTWARE INSTALLATION ==="
 if ($installVPN) {
     if (Install-VPN) {
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds 3
         Install-VPNProfile
     } else {
         Write-Host "Skipping VPN profile import since installation failed."
@@ -654,23 +680,44 @@ if ($installVPN) {
 } else {
     Write-Host "Barracuda VPN install bypassed" -ForegroundColor Cyan
 }
-if ($installVANTAGE) { Install-Vantage } else { Write-Host "Vantage installation bypassed" -ForegroundColor Cyan }
+
+if ($installVANTAGE) { 
+    Install-Vantage -location $location
+} else { 
+    Write-Host "Vantage installation bypassed" -ForegroundColor Cyan 
+}
+
+Write-Host "=== OFFICE 365 DEPLOYMENT ==="
 Remove-Office365
 Install-Office365
-Verify-Installations
+
+Write-Host "=== STARTING VERIFICATION AND UPDATES ==="
+$verifyJob = Start-VerificationJobs
+
+Write-Host "=== RUNNING WINDOWS UPDATES ==="
 Run-WindowsUpdates
+
+Write-Host "=== COLLECTING VERIFICATION RESULTS ==="
+if (Wait-Job -Job $verifyJob -Timeout 60) {
+    Receive-Job -Job $verifyJob | ForEach-Object { Write-Host "[VERIFY] $_" }
+}
+Remove-Job -Job $verifyJob -Force -ErrorAction SilentlyContinue
+
+Write-Host "=== CLEANING UP BACKGROUND JOBS ==="
 try {
-    $bgJobs = Get-Job | Where-Object { $_.Name -like 'InstallJob_*' -or $_.Name -like 'AdobeInstallJob' }
-    foreach ($j in $bgJobs) {
-        if ($j.State -in 'Completed','Failed','Stopped') {
-            Write-Host "Collecting output for background job Id=$($j.Id) Name=$($j.Name) State=$($j.State)"
-            Receive-Job -Job $j -Wait -AutoRemoveJob | ForEach-Object { Write-Host "[BG JOB $($j.Id)] $_" }
+    $allJobs = Get-Job
+    foreach ($job in $allJobs) {
+        if ($job.State -in @('Completed', 'Failed', 'Stopped')) {
+            Write-Host "Collecting output for job: $($job.Name) (State: $($job.State))"
+            Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "[JOB] $_" }
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         } else {
-            Write-Host "Background job Id=$($j.Id) Name=$($j.Name) is still running (State=$($j.State)). Leaving it to finish in background."
+            Write-Host "Job $($job.Name) still running (State: $($job.State))"
         }
     }
 } catch {
-    Write-Host "Error while collecting background job outputs: $_"
+    Write-Host "Error during job cleanup: $_"
 }
-Stop-Transcript
 
+Write-Host "=== DEPLOYMENT COMPLETE ==="
+Stop-Transcript
