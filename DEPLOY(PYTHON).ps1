@@ -600,13 +600,13 @@ function Remove-Office365 {
         Write-Host "=== OFFICE 365 AGGRESSIVE REMOVAL SCRIPT ===" -ForegroundColor Green
         
         Write-Host "`nStep 1: Checking what Office installations exist..." -ForegroundColor Yellow
-        $installedOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "Office|365|OneNote|Teams" }
+        $installedOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard" }
         if ($installedOffice) {
             Write-Host "Found MSI Office installations:" -ForegroundColor Cyan
             $installedOffice | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor White }
         }
         
-        $appxOffice = Get-AppxPackage -AllUsers | Where-Object { $_.Name -match "Office|OneNote|Teams|365" }
+        $appxOffice = Get-AppxPackage -AllUsers | Where-Object { $_.Name -match "Microsoft.*Office|Microsoft.*OneNote|Microsoft.*Teams|Microsoft.*365" }
         if ($appxOffice) {
             Write-Host "Found UWP/Store Office apps:" -ForegroundColor Cyan
             $appxOffice | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor White }
@@ -700,7 +700,7 @@ function Remove-Office365 {
                 $uninstallString = (Get-ItemProperty -Path $key.PSPath -Name "UninstallString" -ErrorAction SilentlyContinue).UninstallString
                 $quietUninstallString = (Get-ItemProperty -Path $key.PSPath -Name "QuietUninstallString" -ErrorAction SilentlyContinue).QuietUninstallString
                 
-                if ($displayName -and ($displayName -match "Office|365|OneNote|Teams|Skype|Microsoft 365|Word|Excel|PowerPoint|Outlook|Access|Publisher")) {
+                if ($displayName -and ($displayName -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard|^Microsoft.*Word|^Microsoft.*Excel|^Microsoft.*PowerPoint|^Microsoft.*Outlook|^Microsoft.*Access|^Microsoft.*Publisher|^OneNote")) {
                     $officeProducts += [PSCustomObject]@{
                         DisplayName = $displayName
                         UninstallString = $uninstallString
@@ -729,7 +729,11 @@ function Remove-Office365 {
                     if ($uninstallCmd -match "msiexec") {
                         $uninstallCmd = $uninstallCmd -replace "/I", "/X"
                         if ($uninstallCmd -notmatch "/quiet") {
-                            $uninstallCmd += " /quiet /norestart"
+                            $uninstallCmd += " /quiet /norestart /qn"
+                        }
+                    } elseif ($uninstallCmd -match "setup\.exe|uninstall\.exe") {
+                        if ($uninstallCmd -notmatch "/quiet|/silent|/s") {
+                            $uninstallCmd += " /quiet"
                         }
                     }
                     Write-Host "Using UninstallString (modified): $uninstallCmd" -ForegroundColor Cyan
@@ -739,12 +743,12 @@ function Remove-Office365 {
                     try {
                         if ($uninstallCmd -match "msiexec") {
                             $args = ($uninstallCmd -split "msiexec.exe")[1].Trim()
-                            Write-Host "Running: msiexec.exe $args" -ForegroundColor Green
-                            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+                            Write-Host "Running silently: msiexec.exe $args" -ForegroundColor Green
+                            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden -NoNewWindow
                             Write-Host "MSI uninstall exit code: $($process.ExitCode)" -ForegroundColor $(if ($process.ExitCode -eq 0) { "Green" } else { "Red" })
                         } else {
-                            Write-Host "Running: $uninstallCmd" -ForegroundColor Green
-                            $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$uninstallCmd`"" -Wait -PassThru -WindowStyle Hidden
+                            Write-Host "Running silently: $uninstallCmd" -ForegroundColor Green
+                            $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$uninstallCmd`"" -Wait -PassThru -WindowStyle Hidden -NoNewWindow
                             Write-Host "Uninstall exit code: $($process.ExitCode)" -ForegroundColor $(if ($process.ExitCode -eq 0) { "Green" } else { "Red" })
                         }
                     } catch {
@@ -761,7 +765,7 @@ function Remove-Office365 {
         
         Write-Host "`nStep 7: PowerShell Package Manager uninstall..." -ForegroundColor Yellow
         try {
-            $packages = Get-Package | Where-Object { $_.Name -match "Office|365|OneNote|Teams|Microsoft 365" }
+            $packages = Get-Package | Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard" }
             foreach ($package in $packages) {
                 Write-Host "Uninstalling package: $($package.Name)" -ForegroundColor Yellow
                 try {
@@ -829,8 +833,8 @@ function Remove-Office365 {
         }
         
         Write-Host "`nStep 10: Final verification..." -ForegroundColor Yellow
-        $remainingOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "Office|365|OneNote" }
-        $remainingAppx = Get-AppxPackage -AllUsers | Where-Object { $_.Name -match "Office|OneNote|365" }
+        $remainingOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Office.*Professional|^Office.*Standard" }
+        $remainingAppx = Get-AppxPackage -AllUsers | Where-Object { $_.Name -match "Microsoft.*Office|Microsoft.*OneNote|Microsoft.*365" }
         
         if ($remainingOffice -or $remainingAppx) {
             Write-Host "WARNING: Some Office components may still remain:" -ForegroundColor Red
