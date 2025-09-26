@@ -591,15 +591,30 @@ function Install-Vantage {
 }
 
 function Remove-Office365 {
+    if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+        Write-Host "ERROR: This script must be run as Administrator!" -ForegroundColor Red
+        return
+    }
+    
     try {
+        Write-Host "Starting Office 365 removal process..." -ForegroundColor Green
+        
         $procList = "winword","excel","powerpnt","outlook","onenote","msaccess","mspub","lync","teams","onenotem","onenoteim","officeclicktorun","msteams","skype"
-        Get-Process -Name $procList -ErrorAction SilentlyContinue | Stop-Process -Force
+        Write-Host "Stopping Office processes..." -ForegroundColor Cyan
+        $runningProcs = Get-Process -Name $procList -ErrorAction SilentlyContinue
+        if ($runningProcs) {
+            Write-Host "Found running Office processes: $($runningProcs.Name -join ', ')" -ForegroundColor Yellow
+            $runningProcs | Stop-Process -Force
+            Start-Sleep -Seconds 3
+        }
         
         $services = "ClickToRunSvc","OfficeSvc","OfficeClickToRun"
+        Write-Host "Stopping Office services..." -ForegroundColor Cyan
         foreach ($svc in $services) {
             if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
                 Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
                 Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+                Write-Host "Stopped service: $svc" -ForegroundColor Yellow
             }
         }
         
@@ -612,18 +627,38 @@ function Remove-Office365 {
         
         foreach ($url in $saraUrls) {
             try {
+                Write-Host "Downloading SaRACmd from: $url" -ForegroundColor Yellow
                 Invoke-WebRequest -Uri $url -OutFile $saraZip -UseBasicParsing -ErrorAction Stop
+                Write-Host "Extracting SaRACmd..." -ForegroundColor Yellow
+                if (Test-Path "$env:TEMP\SaRACmd") { Remove-Item "$env:TEMP\SaRACmd" -Recurse -Force }
                 Expand-Archive -Path $saraZip -DestinationPath "$env:TEMP\SaRACmd" -Force -ErrorAction Stop
                 break
             }
-            catch { continue }
+            catch { 
+                Write-Host "Failed to download from $url, trying next..." -ForegroundColor Red
+                continue 
+            }
         }
         
         if (Test-Path $saraPath) {
+            Write-Host "Running Microsoft Office Scrub Tool..." -ForegroundColor Green
             $saraArgs = "-S OfficeScrubScenario -AcceptEula -OfficeVersion All"
-            Start-Process -FilePath $saraPath -ArgumentList $saraArgs -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+            $process = Start-Process -FilePath $saraPath -ArgumentList $saraArgs -Wait -PassThru -WindowStyle Hidden
+            $exitCode = $process.ExitCode
+            Write-Host "SaRACmd completed with exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { "Green" } else { "Red" })
+            
+            switch ($exitCode) {
+                0 { Write-Host "Successfully completed Office removal" -ForegroundColor Green }
+                1 { Write-Host "General failure in Office removal" -ForegroundColor Red }
+                6 { Write-Host "Office programs were running - trying again..." -ForegroundColor Yellow }
+                68 { Write-Host "No Office version found by SaRACmd" -ForegroundColor Yellow }
+                default { Write-Host "Unknown exit code: $exitCode" -ForegroundColor Red }
+            }
+        } else {
+            Write-Host "Failed to download SaRACmd, continuing with manual removal..." -ForegroundColor Red
         }
         
+        Write-Host "Removing UWP Office apps..." -ForegroundColor Cyan
         $appxPatterns = @(
             "Microsoft.Office*",
             "Microsoft.MicrosoftOfficeHub",
@@ -633,10 +668,15 @@ function Remove-Office365 {
             "Microsoft.365*"
         )
         foreach ($pattern in $appxPatterns) {
-            Get-AppxPackage -Name $pattern -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            $apps = Get-AppxPackage -Name $pattern -AllUsers -ErrorAction SilentlyContinue
+            if ($apps) {
+                Write-Host "Removing UWP app: $pattern" -ForegroundColor Yellow
+                $apps | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            }
             Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $pattern } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
         }
         
+        Write-Host "Running Office Deployment Tool removal..." -ForegroundColor Cyan
         $odtConfig = @"
 <Configuration>
   <Remove All="TRUE" />
@@ -648,18 +688,25 @@ function Remove-Office365 {
         $odtDownloadUrl = "https://download.microsoft.com/download/2/6/E/26E0FABB-2A0A-45D3-9F05-7CF88E0D2F0C/officedeploymenttool_19231-20072.exe"
         
         if (-not (Test-Path $odtPath)) {
+            Write-Host "Downloading Office Deployment Tool..." -ForegroundColor Yellow
             Invoke-WebRequest -Uri $odtDownloadUrl -OutFile "$env:TEMP\odt.exe" -UseBasicParsing -ErrorAction SilentlyContinue
             Start-Process "$env:TEMP\odt.exe" -ArgumentList "/quiet /extract:$env:TEMP" -Wait -ErrorAction SilentlyContinue
         }
         
         if (Test-Path $odtPath) {
             $odtConfig | Out-File -FilePath $configPath -Encoding ASCII
+            Write-Host "Running ODT removal..." -ForegroundColor Yellow
             Start-Process -FilePath $odtPath -ArgumentList "/configure $configPath" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
         }
         
+        Write-Host "Removing MSI Office installations..." -ForegroundColor Cyan
         $msiOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "Office" -or $_.Name -match "Microsoft 365" -or $_.Name -match "OneNote" -or $_.Name -match "Skype" -or $_.Name -match "Teams" }
-        foreach ($app in $msiOffice) { $app.Uninstall() | Out-Null }
+        foreach ($app in $msiOffice) { 
+            Write-Host "Uninstalling: $($app.Name)" -ForegroundColor Yellow
+            $app.Uninstall() | Out-Null 
+        }
         
+        Write-Host "Cleaning up file system..." -ForegroundColor Cyan
         $paths = @(
             "C:\Program Files\Microsoft Office",
             "C:\Program Files (x86)\Microsoft Office",
@@ -677,9 +724,13 @@ function Remove-Office365 {
             "$env:APPDATA\Microsoft\Skype"
         )
         foreach ($path in $paths) {
-            if (Test-Path $path) { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $path) { 
+                Write-Host "Removing: $path" -ForegroundColor Yellow
+                Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue 
+            }
         }
         
+        Write-Host "Cleaning up registry..." -ForegroundColor Cyan
         $regPaths = @(
             "HKLM:\SOFTWARE\Microsoft\Office",
             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office",
@@ -692,10 +743,18 @@ function Remove-Office365 {
             "HKLM:\SOFTWARE\Microsoft\Skype"
         )
         foreach ($reg in $regPaths) {
-            if (Test-Path $reg) { Remove-Item -Path $reg -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $reg) { 
+                Write-Host "Removing registry key: $reg" -ForegroundColor Yellow
+                Remove-Item -Path $reg -Recurse -Force -ErrorAction SilentlyContinue 
+            }
         }
+        
+        Write-Host "Office 365 removal completed!" -ForegroundColor Green
+        Write-Host "Please reboot before installing new Office version." -ForegroundColor Yellow
     }
-    catch {}
+    catch {
+        Write-Host "Error during removal: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
 
 function Install-AdobeReader {
