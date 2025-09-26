@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$timezone,
     [string]$location,
     [string]$computerName,
@@ -523,8 +523,20 @@ function Install-VPNProfile {
 
 
 function Install-Office365 {
-    $installer = "$folderPath\OfficeSetup.exe"
-    Run-Installer -Path $installer
+    $setupPath = Join-Path $folderPath "setup.exe"
+    $configPath = Join-Path $folderPath "officesilent.xml"
+    
+    if (-not (Test-Path $setupPath)) { Write-Host "Setup file not found: $setupPath"; return $false }
+    if (-not (Test-Path $configPath)) { Write-Host "Configuration file not found: $configPath"; return $false }
+    
+    $args = @(
+        "/configure", "`"$configPath`""
+    )
+    Write-Host "Installing Office 365..."
+    Start-Process -FilePath $setupPath -ArgumentList $args -Wait -WindowStyle Hidden
+    
+    Write-Host "Office 365 installation complete."
+    return $true
 }
 
 function Verify-Installations {
@@ -629,5 +641,4 @@ try {
     Write-Host "Error while collecting background job outputs: $_"
 }
 Stop-Transcript
-
 
