@@ -591,101 +591,174 @@ function Install-Vantage {
 }
 
 function Remove-Office365 {
+    [CmdletBinding()]
+    param(
+        [switch]$Force,
+        [switch]$WhatIf
+    )
+    
     if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-        Write-Host "ERROR: This script must be run as Administrator!" -ForegroundColor Red
+        Write-Error "ERROR: This script must be run as Administrator!"
         return
     }
     
+    $windowsVersion = [System.Environment]::OSVersion.Version
+    $isWindows10Plus = $windowsVersion.Major -ge 10
+    $isWindows8Plus = $windowsVersion.Major -gt 6 -or ($windowsVersion.Major -eq 6 -and $windowsVersion.Minor -ge 2)
+    
     try {
-        Write-Host "=== OFFICE 365 AGGRESSIVE REMOVAL SCRIPT ===" -ForegroundColor Green
+        Write-Host "=== OFFICE 365 REMOVAL SCRIPT (IMPROVED) ===" -ForegroundColor Green
+        Write-Host "Windows Version: $($windowsVersion.ToString())" -ForegroundColor Cyan
         
-        Write-Host "`nStep 1: Checking what Office installations exist..." -ForegroundColor Yellow
-        $installedOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard" }
+        if ($WhatIf) {
+            Write-Host "RUNNING IN WHATIF MODE - No changes will be made" -ForegroundColor Yellow
+        }
+        
+        Write-Host "Step 1: Detecting Office installations..." -ForegroundColor Yellow
+        
+        $installedOffice = @()
+        try {
+            $installedOffice = Get-CimInstance -Class Win32_Product -ErrorAction Stop | 
+                Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard" }
+        } catch {
+            Write-Warning "CIM query failed, falling back to registry detection"
+            $uninstallKeys = @(
+                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            )
+            foreach ($keyPath in $uninstallKeys) {
+                $keys = Get-ChildItem -Path $keyPath -ErrorAction SilentlyContinue
+                foreach ($key in $keys) {
+                    $displayName = (Get-ItemProperty -Path $key.PSPath -Name "DisplayName" -ErrorAction SilentlyContinue).DisplayName
+                    if ($displayName -and ($displayName -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard")) {
+                        $installedOffice += [PSCustomObject]@{
+                            Name = $displayName
+                            Source = "Registry"
+                        }
+                    }
+                }
+            }
+        }
+        
         if ($installedOffice) {
-            Write-Host "Found MSI Office installations:" -ForegroundColor Cyan
+            Write-Host "Found Office installations:" -ForegroundColor Cyan
             $installedOffice | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor White }
         }
         
-        $appxOffice = Get-AppxPackage -AllUsers | Where-Object { $_.Name -match "Microsoft.*Office|Microsoft.*OneNote|Microsoft.*Teams|Microsoft.*365" }
-        if ($appxOffice) {
-            Write-Host "Found UWP/Store Office apps:" -ForegroundColor Cyan
-            $appxOffice | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor White }
+        $appxOffice = @()
+        if ($isWindows8Plus) {
+            try {
+                $appxOffice = Get-AppxPackage -AllUsers -ErrorAction Stop | 
+                    Where-Object { $_.Name -match "Microsoft.*Office|Microsoft.*OneNote|Microsoft.*Teams|Microsoft.*365" }
+                if ($appxOffice) {
+                    Write-Host "Found UWP/Store Office apps:" -ForegroundColor Cyan
+                    $appxOffice | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor White }
+                }
+            } catch {
+                Write-Warning "AppX package detection failed: $($_.Exception.Message)"
+            }
         }
         
-        Write-Host "`nStep 2: FORCE KILLING all Office processes..." -ForegroundColor Yellow
-        $procList = "winword","excel","powerpnt","outlook","onenote","msaccess","mspub","lync","teams","onenotem","onenoteim","officeclicktorun","msteams","skype","OfficeClickToRun"
+        Write-Host "`nStep 2: Terminating Office processes..." -ForegroundColor Yellow
+        $procList = @("winword","excel","powerpnt","outlook","onenote","msaccess","mspub","lync","teams","onenotem","onenoteim","officeclicktorun","msteams","skype","OfficeClickToRun")
         $killedProcs = @()
+        
         foreach ($proc in $procList) {
             $processes = Get-Process -Name $proc -ErrorAction SilentlyContinue
             if ($processes) {
-                $killedProcs += $proc
-                $processes | Stop-Process -Force -ErrorAction SilentlyContinue
+                if ($Force -or $WhatIf) {
+                    if (-not $WhatIf) {
+                        $processes | Stop-Process -Force -ErrorAction SilentlyContinue
+                    }
+                    $killedProcs += $proc
+                } else {
+                    $response = Read-Host "Process '$proc' is running. Force kill? (y/N)"
+                    if ($response -eq 'y' -or $response -eq 'Y') {
+                        $processes | Stop-Process -Force -ErrorAction SilentlyContinue
+                        $killedProcs += $proc
+                    }
+                }
             }
         }
-        if ($killedProcs.Count -gt 0) {
-            Write-Host "Killed processes: $($killedProcs -join ', ')" -ForegroundColor Red
-        }
-        Start-Sleep -Seconds 5
         
-        Write-Host "`nStep 3: FORCE STOPPING and DISABLING Office services..." -ForegroundColor Yellow
-        $services = "ClickToRunSvc","OfficeSvc","OfficeClickToRun"
+        if ($killedProcs.Count -gt 0) {
+            Write-Host "$(if($WhatIf){'Would kill':'Killed'}) processes: $($killedProcs -join ', ')" -ForegroundColor $(if($WhatIf){'Yellow'}else{'Red'})
+        }
+        
+        if (-not $WhatIf) {
+            Start-Sleep -Seconds 3
+        }
+        
+        Write-Host "`nStep 3: Managing Office services..." -ForegroundColor Yellow
+        $services = @("ClickToRunSvc","OfficeSvc","OfficeClickToRun")
+        
         foreach ($svc in $services) {
             $service = Get-Service -Name $svc -ErrorAction SilentlyContinue
             if ($service) {
-                Write-Host "Stopping service: $svc (Status: $($service.Status))" -ForegroundColor Cyan
-                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
-                Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
-            }
-        }
-        
-        Write-Host "`nStep 4: NUCLEAR OPTION - Direct ClickToRun removal..." -ForegroundColor Yellow
-        $clickToRunPaths = @(
-            "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe",
-            "C:\Program Files (x86)\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
-        )
-        foreach ($path in $clickToRunPaths) {
-            if (Test-Path $path) {
-                Write-Host "Found ClickToRun at: $path" -ForegroundColor Cyan
-                Write-Host "Running ClickToRun removal..." -ForegroundColor Yellow
-                try {
-                    & "$path" scenario=install scenariosubtype=ARP sourcetype=None productstoremove=All culture=en-us version.16=16.0
-                    Start-Sleep -Seconds 10
-                } catch {
-                    Write-Host "ClickToRun removal failed: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "$(if($WhatIf){'Would manage':'Managing'}) service: $svc (Status: $($service.Status))" -ForegroundColor Cyan
+                if (-not $WhatIf) {
+                    if ($service.Status -eq 'Running') {
+                        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                    }
+                    Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
                 }
             }
         }
         
-        Write-Host "`nStep 5: AGGRESSIVE UWP app removal..." -ForegroundColor Yellow
-        $appxPatterns = @(
-            "Microsoft.Office*",
-            "Microsoft.MicrosoftOfficeHub*",
-            "Microsoft.OneNote*",
-            "Microsoft.SkypeApp*",
-            "Microsoft.Teams*",
-            "Microsoft.365*",
-            "*Office*",
-            "*OneNote*"
-        )
-        foreach ($pattern in $appxPatterns) {
-            $apps = Get-AppxPackage -Name $pattern -AllUsers -ErrorAction SilentlyContinue
-            foreach ($app in $apps) {
-                Write-Host "Removing UWP app: $($app.Name)" -ForegroundColor Red
+        Write-Host "`nStep 4: ClickToRun removal..." -ForegroundColor Yellow
+        $clickToRunPaths = @()
+        
+        $programFilesPaths = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path $_) }
+        foreach ($programFiles in $programFilesPaths) {
+            $ctrPath = Join-Path $programFiles "Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
+            if (Test-Path $ctrPath) {
+                $clickToRunPaths += $ctrPath
+            }
+        }
+        
+        foreach ($path in $clickToRunPaths) {
+            Write-Host "$(if($WhatIf){'Would use':'Using'}) ClickToRun at: $path" -ForegroundColor Cyan
+            if (-not $WhatIf) {
                 try {
-                    Remove-AppxPackage -Package $app.PackageFullName -AllUsers -ErrorAction Stop
+                    $process = Start-Process -FilePath $path -ArgumentList "scenario=install", "scenariosubtype=ARP", "sourcetype=None", "productstoremove=All" -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+                    Write-Host "ClickToRun removal exit code: $($process.ExitCode)" -ForegroundColor $(if ($process.ExitCode -eq 0) { "Green" } else { "Red" })
                 } catch {
-                    Write-Host "Failed to remove $($app.Name): $($_.Exception.Message)" -ForegroundColor Red
+                    Write-Warning "ClickToRun removal failed: $($_.Exception.Message)"
+                }
+            }
+        }
+        
+        if ($isWindows8Plus -and $appxOffice) {
+            Write-Host "`nStep 5: UWP app removal..." -ForegroundColor Yellow
+            
+            foreach ($app in $appxOffice) {
+                Write-Host "$(if($WhatIf){'Would remove':'Removing'}) UWP app: $($app.Name)" -ForegroundColor Red
+                if (-not $WhatIf) {
+                    try {
+                        Remove-AppxPackage -Package $app.PackageFullName -AllUsers -ErrorAction Stop
+                        Write-Host "Successfully removed: $($app.Name)" -ForegroundColor Green
+                    } catch {
+                        Write-Warning "Failed to remove $($app.Name): $($_.Exception.Message)"
+                    }
                 }
             }
             
-            $provisionedApps = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $pattern }
-            foreach ($app in $provisionedApps) {
-                Write-Host "Removing provisioned app: $($app.DisplayName)" -ForegroundColor Red
-                Remove-AppxProvisionedPackage -Online -PackageName $app.PackageName -ErrorAction SilentlyContinue
+            if ($isWindows10Plus) {
+                $appxPatterns = @("Microsoft.Office*", "Microsoft.MicrosoftOfficeHub*", "Microsoft.OneNote*", "Microsoft.Teams*", "Microsoft.365*")
+                foreach ($pattern in $appxPatterns) {
+                    $provisionedApps = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.DisplayName -like $pattern }
+                    foreach ($app in $provisionedApps) {
+                        Write-Host "$(if($WhatIf){'Would remove':'Removing'}) provisioned app: $($app.DisplayName)" -ForegroundColor Red
+                        if (-not $WhatIf) {
+                            Remove-AppxProvisionedPackage -Online -PackageName $app.PackageName -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
             }
         }
         
-        Write-Host "`nStep 6: CONTROL PANEL simulation - Registry-based uninstall..." -ForegroundColor Yellow
+        Write-Host "`nStep 6: Registry-based uninstall..." -ForegroundColor Yellow
         
         $uninstallKeys = @(
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -696,159 +769,151 @@ function Remove-Office365 {
         foreach ($keyPath in $uninstallKeys) {
             $keys = Get-ChildItem -Path $keyPath -ErrorAction SilentlyContinue
             foreach ($key in $keys) {
-                $displayName = (Get-ItemProperty -Path $key.PSPath -Name "DisplayName" -ErrorAction SilentlyContinue).DisplayName
-                $uninstallString = (Get-ItemProperty -Path $key.PSPath -Name "UninstallString" -ErrorAction SilentlyContinue).UninstallString
-                $quietUninstallString = (Get-ItemProperty -Path $key.PSPath -Name "QuietUninstallString" -ErrorAction SilentlyContinue).QuietUninstallString
-                
-                if ($displayName -and ($displayName -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard|^Microsoft.*Word|^Microsoft.*Excel|^Microsoft.*PowerPoint|^Microsoft.*Outlook|^Microsoft.*Access|^Microsoft.*Publisher|^OneNote")) {
+                $properties = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
+                if ($properties.DisplayName -and ($properties.DisplayName -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard")) {
                     $officeProducts += [PSCustomObject]@{
-                        DisplayName = $displayName
-                        UninstallString = $uninstallString
-                        QuietUninstallString = $quietUninstallString
+                        DisplayName = $properties.DisplayName
+                        UninstallString = $properties.UninstallString
+                        QuietUninstallString = $properties.QuietUninstallString
                         RegistryKey = $key.PSPath
+                        Publisher = $properties.Publisher
+                        Version = $properties.DisplayVersion
                     }
                 }
             }
         }
         
-        if ($officeProducts.Count -gt 0) {
-            Write-Host "Found Office products in Control Panel registry:" -ForegroundColor Cyan
-            foreach ($product in $officeProducts) {
-                Write-Host "  - $($product.DisplayName)" -ForegroundColor White
-            }
+        foreach ($product in $officeProducts) {
+            Write-Host "$(if($WhatIf){'Would uninstall':'Uninstalling'}): $($product.DisplayName)" -ForegroundColor Yellow
             
-            foreach ($product in $officeProducts) {
-                Write-Host "`nUninstalling: $($product.DisplayName)" -ForegroundColor Yellow
-                
+            if (-not $WhatIf) {
                 $uninstallCmd = $null
                 if ($product.QuietUninstallString) {
                     $uninstallCmd = $product.QuietUninstallString
-                    Write-Host "Using QuietUninstallString: $uninstallCmd" -ForegroundColor Cyan
                 } elseif ($product.UninstallString) {
                     $uninstallCmd = $product.UninstallString
                     if ($uninstallCmd -match "msiexec") {
                         $uninstallCmd = $uninstallCmd -replace "/I", "/X"
-                        if ($uninstallCmd -notmatch "/quiet") {
+                        if ($uninstallCmd -notmatch "/quiet|/qn") {
                             $uninstallCmd += " /quiet /norestart /qn"
                         }
-                    } elseif ($uninstallCmd -match "setup\.exe|uninstall\.exe") {
-                        if ($uninstallCmd -notmatch "/quiet|/silent|/s") {
-                            $uninstallCmd += " /quiet"
-                        }
                     }
-                    Write-Host "Using UninstallString (modified): $uninstallCmd" -ForegroundColor Cyan
                 }
                 
                 if ($uninstallCmd) {
                     try {
                         if ($uninstallCmd -match "msiexec") {
-                            $args = ($uninstallCmd -split "msiexec.exe")[1].Trim()
-                            Write-Host "Running silently: msiexec.exe $args" -ForegroundColor Green
-                            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden -NoNewWindow
-                            Write-Host "MSI uninstall exit code: $($process.ExitCode)" -ForegroundColor $(if ($process.ExitCode -eq 0) { "Green" } else { "Red" })
+                            $args = ($uninstallCmd -split "msiexec.exe", 2)[1].Trim()
+                            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+                            Write-Host "Uninstall exit code: $($process.ExitCode)" -ForegroundColor $(if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) { "Green" } else { "Red" })
                         } else {
-                            Write-Host "Running silently: $uninstallCmd" -ForegroundColor Green
-                            $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$uninstallCmd`"" -Wait -PassThru -WindowStyle Hidden -NoNewWindow
+                            $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "`"$uninstallCmd`"" -Wait -PassThru -WindowStyle Hidden
                             Write-Host "Uninstall exit code: $($process.ExitCode)" -ForegroundColor $(if ($process.ExitCode -eq 0) { "Green" } else { "Red" })
                         }
                     } catch {
-                        Write-Host "Failed to run uninstall command: $($_.Exception.Message)" -ForegroundColor Red
+                        Write-Warning "Failed to run uninstall command: $($_.Exception.Message)"
                     }
-                } else {
-                    Write-Host "No valid uninstall command found for $($product.DisplayName)" -ForegroundColor Red
-                }
-                Start-Sleep -Seconds 2
-            }
-        } else {
-            Write-Host "No Office products found in Control Panel registry" -ForegroundColor Green
-        }
-        
-        Write-Host "`nStep 7: PowerShell Package Manager uninstall..." -ForegroundColor Yellow
-        try {
-            $packages = Get-Package | Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard" }
-            foreach ($package in $packages) {
-                Write-Host "Uninstalling package: $($package.Name)" -ForegroundColor Yellow
-                try {
-                    Uninstall-Package -Name $package.Name -Force -ErrorAction Stop
-                    Write-Host "Successfully uninstalled: $($package.Name)" -ForegroundColor Green
-                } catch {
-                    Write-Host "Failed to uninstall package $($package.Name): $($_.Exception.Message)" -ForegroundColor Red
-                }
-            }
-        } catch {
-            Write-Host "Package Manager method failed: $($_.Exception.Message)" -ForegroundColor Red
-        }
-        
-        Write-Host "`nStep 8: NUCLEAR FILE SYSTEM cleanup..." -ForegroundColor Yellow
-        $paths = @(
-            "C:\Program Files\Microsoft Office",
-            "C:\Program Files (x86)\Microsoft Office",
-            "C:\Program Files\Common Files\Microsoft Shared\Office*",
-            "C:\Program Files (x86)\Common Files\Microsoft Shared\Office*",
-            "C:\Program Files\Common Files\Microsoft Shared\ClickToRun",
-            "C:\Program Files (x86)\Common Files\Microsoft Shared\ClickToRun",
-            "C:\Program Files\WindowsApps\Microsoft.Office*",
-            "C:\Program Files\WindowsApps\Microsoft.OneNote*",
-            "$env:LOCALAPPDATA\Microsoft\Office",
-            "$env:APPDATA\Microsoft\Office",
-            "$env:ProgramData\Microsoft\Office",
-            "$env:LOCALAPPDATA\Microsoft\OneNote",
-            "$env:APPDATA\Microsoft\OneNote",
-            "$env:LOCALAPPDATA\Microsoft\Teams",
-            "$env:APPDATA\Microsoft\Teams",
-            "$env:LOCALAPPDATA\Microsoft\Skype",
-            "$env:APPDATA\Microsoft\Skype"
-        )
-        foreach ($path in $paths) {
-            $expandedPaths = Get-ChildItem -Path (Split-Path $path -Parent) -Filter (Split-Path $path -Leaf) -ErrorAction SilentlyContinue
-            foreach ($expandedPath in $expandedPaths) {
-                if (Test-Path $expandedPath.FullName) { 
-                    Write-Host "NUKING directory: $($expandedPath.FullName)" -ForegroundColor Red
-                    Remove-Item -Path $expandedPath.FullName -Recurse -Force -ErrorAction SilentlyContinue
                 }
             }
         }
         
-        Write-Host "`nStep 9: NUCLEAR REGISTRY cleanup..." -ForegroundColor Yellow
+        Write-Host "`nStep 7: File system cleanup..." -ForegroundColor Yellow
+        
+        $basePaths = @()
+        if ($env:ProgramFiles) { $basePaths += $env:ProgramFiles }
+        if (${env:ProgramFiles(x86)}) { $basePaths += ${env:ProgramFiles(x86)} }
+        
+        $cleanupPaths = @()
+        foreach ($basePath in $basePaths) {
+            $cleanupPaths += Join-Path $basePath "Microsoft Office"
+            $cleanupPaths += Join-Path $basePath "Common Files\Microsoft Shared\Office*"
+            $cleanupPaths += Join-Path $basePath "Common Files\Microsoft Shared\ClickToRun"
+        }
+        
+        $cleanupPaths += Join-Path $env:LOCALAPPDATA "Microsoft\Office"
+        $cleanupPaths += Join-Path $env:APPDATA "Microsoft\Office"
+        $cleanupPaths += Join-Path $env:ProgramData "Microsoft\Office"
+        
+        foreach ($path in $cleanupPaths) {
+            if ($path -match '\*') {
+                $parentPath = Split-Path $path -Parent
+                $filter = Split-Path $path -Leaf
+                if (Test-Path $parentPath) {
+                    $matchingPaths = Get-ChildItem -Path $parentPath -Filter $filter -ErrorAction SilentlyContinue
+                    foreach ($matchingPath in $matchingPaths) {
+                        Write-Host "$(if($WhatIf){'Would remove':'Removing'}) directory: $($matchingPath.FullName)" -ForegroundColor Red
+                        if (-not $WhatIf) {
+                            Remove-Item -Path $matchingPath.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            } else {
+                if (Test-Path $path) {
+                    Write-Host "$(if($WhatIf){'Would remove':'Removing'}) directory: $path" -ForegroundColor Red
+                    if (-not $WhatIf) {
+                        Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+        
+        Write-Host "`nStep 8: Registry cleanup..." -ForegroundColor Yellow
+        
         $regPaths = @(
-            "HKLM:\SOFTWARE\Microsoft\Office",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office",
             "HKCU:\Software\Microsoft\Office",
-            "HKCU:\Software\Microsoft\OneNote",
-            "HKLM:\SOFTWARE\Microsoft\OneNote",
-            "HKCU:\Software\Microsoft\Teams",
-            "HKLM:\SOFTWARE\Microsoft\Teams",
-            "HKCU:\Software\Microsoft\Skype",
-            "HKLM:\SOFTWARE\Microsoft\Skype",
-            "HKLM:\SOFTWARE\Classes\OneNote*",
-            "HKLM:\SOFTWARE\Classes\Word*",
-            "HKLM:\SOFTWARE\Classes\Excel*",
-            "HKLM:\SOFTWARE\Classes\PowerPoint*"
+            "HKCU:\Software\Microsoft\OneNote"
         )
-        foreach ($reg in $regPaths) {
-            if (Test-Path $reg) { 
-                Write-Host "NUKING registry key: $reg" -ForegroundColor Red
-                Remove-Item -Path $reg -Recurse -Force -ErrorAction SilentlyContinue
+        
+        if ($Force) {
+            $regPaths += @(
+                "HKLM:\SOFTWARE\Microsoft\Office",
+                "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office"
+            )
+        }
+        
+        foreach ($regPath in $regPaths) {
+            if (Test-Path $regPath) {
+                Write-Host "$(if($WhatIf){'Would remove':'Removing'}) registry key: $regPath" -ForegroundColor Red
+                if (-not $WhatIf) {
+                    Remove-Item -Path $regPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
             }
         }
         
-        Write-Host "`nStep 10: Final verification..." -ForegroundColor Yellow
-        $remainingOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Office.*Professional|^Office.*Standard" }
-        $remainingAppx = Get-AppxPackage -AllUsers | Where-Object { $_.Name -match "Microsoft.*Office|Microsoft.*OneNote|Microsoft.*365" }
+        Write-Host "`nStep 9: Final verification..." -ForegroundColor Yellow
         
-        if ($remainingOffice -or $remainingAppx) {
-            Write-Host "WARNING: Some Office components may still remain:" -ForegroundColor Red
-            $remainingOffice | ForEach-Object { Write-Host "  MSI: $($_.Name)" -ForegroundColor Red }
-            $remainingAppx | ForEach-Object { Write-Host "  UWP: $($_.Name)" -ForegroundColor Red }
-        } else {
-            Write-Host "SUCCESS: No Office installations detected!" -ForegroundColor Green
+        if (-not $WhatIf) {
+            $remainingOffice = @()
+            try {
+                $remainingOffice = Get-CimInstance -Class Win32_Product -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Office.*Professional|^Office.*Standard" }
+            } catch {
+                Write-Host "Using registry-based verification..." -ForegroundColor Cyan
+            }
+            
+            $remainingAppx = @()
+            if ($isWindows8Plus) {
+                $remainingAppx = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -match "Microsoft.*Office|Microsoft.*OneNote|Microsoft.*365" }
+            }
+            
+            if ($remainingOffice -or $remainingAppx) {
+                Write-Host "WARNING: Some Office components may still remain:" -ForegroundColor Red
+                $remainingOffice | ForEach-Object { Write-Host "  MSI: $($_.Name)" -ForegroundColor Red }
+                $remainingAppx | ForEach-Object { Write-Host "  UWP: $($_.Name)" -ForegroundColor Red }
+            } else {
+                Write-Host "SUCCESS: No Office installations detected!" -ForegroundColor Green
+            }
         }
         
         Write-Host "`n=== OFFICE REMOVAL COMPLETED ===" -ForegroundColor Green
-        Write-Host "REBOOT REQUIRED before installing new Office!" -ForegroundColor Yellow
+        if (-not $WhatIf) {
+            Write-Host "REBOOT RECOMMENDED before installing new Office!" -ForegroundColor Yellow
+        }
     }
     catch {
-        Write-Host "Error during removal: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Error "Error during removal: $($_.Exception.Message)"
+        Write-Host "Stack trace: $($_.Exception.StackTrace)" -ForegroundColor Red
     }
 }
 
