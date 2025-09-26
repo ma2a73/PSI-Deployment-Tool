@@ -592,11 +592,29 @@ function Install-Vantage {
 
 function Remove-Office365 {
     try {
-        Write-Host "=== Removing Office 365 and related components ==="
+        $procList = "winword","excel","powerpnt","outlook","onenote","msaccess","mspub","lync","teams","onenotem","onenoteim","officeclicktorun","msteams","skype"
+        Get-Process -Name $procList -ErrorAction SilentlyContinue | Stop-Process -Force
 
-        Get-AppxPackage -Name "*Office*" -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-        Get-AppxPackage -Name "Microsoft.Office.Desktop*" -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-        Get-AppxPackage -Name "Microsoft.OfficeHub" -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        $services = "ClickToRunSvc","OfficeSvc","OfficeClickToRun"
+        foreach ($svc in $services) {
+            if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
+                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            }
+        }
+
+        $appxPatterns = @(
+            "Microsoft.Office*",
+            "Microsoft.MicrosoftOfficeHub",
+            "Microsoft.OneNote*",
+            "Microsoft.SkypeApp*",
+            "Microsoft.Teams*",
+            "Microsoft.365*"
+        )
+        foreach ($pattern in $appxPatterns) {
+            Get-AppxPackage -Name $pattern -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+            Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $pattern } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+        }
 
         $odtConfig = @"
 <Configuration>
@@ -606,26 +624,55 @@ function Remove-Office365 {
 "@
         $configPath = "$env:TEMP\RemoveOffice.xml"
         $odtPath    = "$env:TEMP\setup.exe"
+        $odtDownloadUrl = "https://download.microsoft.com/download/2/6/E/26E0FABB-2A0A-45D3-9F05-7CF88E0D2F0C/officedeploymenttool_19231-20072.exe"
 
         if (-not (Test-Path $odtPath)) {
-            Invoke-WebRequest -Uri "https://download.microsoft.com/download/2/6/E/26E0FABB-2A0A-45D3-9F05-7CF88E0D2F0C/officedeploymenttool.exe" -OutFile "$env:TEMP\odt.exe"
+            Invoke-WebRequest -Uri $odtDownloadUrl -OutFile "$env:TEMP\odt.exe" -UseBasicParsing
             Start-Process "$env:TEMP\odt.exe" -ArgumentList "/quiet /extract:$env:TEMP" -Wait
         }
 
         $odtConfig | Out-File -FilePath $configPath -Encoding ASCII
         Start-Process -FilePath $odtPath -ArgumentList "/configure $configPath" -Wait
 
-        $msiOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "Office" -or $_.Name -match "Microsoft 365" }
-        foreach ($app in $msiOffice) {
-            Write-Host "Uninstalling MSI Office: $($app.Name)"
-            $app.Uninstall() | Out-Null
+        $msiOffice = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -match "Office" -or $_.Name -match "Microsoft 365" -or $_.Name -match "OneNote" -or $_.Name -match "Skype" -or $_.Name -match "Teams" }
+        foreach ($app in $msiOffice) { $app.Uninstall() | Out-Null }
+
+        $paths = @(
+            "C:\Program Files\Microsoft Office",
+            "C:\Program Files (x86)\Microsoft Office",
+            "C:\Program Files\Common Files\Microsoft Shared\Office",
+            "C:\Program Files (x86)\Common Files\Microsoft Shared\Office",
+            "C:\Program Files\Common Files\Microsoft Shared\ClickToRun",
+            "$env:LOCALAPPDATA\Microsoft\Office",
+            "$env:APPDATA\Microsoft\Office",
+            "$env:ProgramData\Microsoft\Office",
+            "$env:LOCALAPPDATA\Microsoft\OneNote",
+            "$env:APPDATA\Microsoft\OneNote",
+            "$env:LOCALAPPDATA\Microsoft\Teams",
+            "$env:APPDATA\Microsoft\Teams",
+            "$env:LOCALAPPDATA\Microsoft\Skype",
+            "$env:APPDATA\Microsoft\Skype"
+        )
+        foreach ($path in $paths) {
+            if (Test-Path $path) { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
-        Write-Host "Office 365 removal complete. Reboot recommended."
+        $regPaths = @(
+            "HKLM:\SOFTWARE\Microsoft\Office",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office",
+            "HKCU:\Software\Microsoft\Office",
+            "HKCU:\Software\Microsoft\OneNote",
+            "HKLM:\SOFTWARE\Microsoft\OneNote",
+            "HKCU:\Software\Microsoft\Teams",
+            "HKLM:\SOFTWARE\Microsoft\Teams",
+            "HKCU:\Software\Microsoft\Skype",
+            "HKLM:\SOFTWARE\Microsoft\Skype"
+        )
+        foreach ($reg in $regPaths) {
+            if (Test-Path $reg) { Remove-Item -Path $reg -Recurse -Force -ErrorAction SilentlyContinue }
+        }
     }
-    catch {
-        Write-Host "Error during Office removal: $_"
-    }
+    catch {}
 }
 
 function Install-AdobeReader {
