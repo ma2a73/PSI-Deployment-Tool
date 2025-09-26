@@ -597,7 +597,7 @@ Install-SharedDriveTask
 Switch-Logs
 Enable-RDP
 Install-TeamViewer
-$adobeJob = Install-AdobeReader
+Install-AdobeReader
 Enable-DotNetFramework
 if (Install-CrowdStrike) { Write-Host "CrowdStrike finished, continuing..." } else { Write-Host "CrowdStrike failed, continuing anyway..." }
 if ($installVPN) {
@@ -629,4 +629,5 @@ try {
     Write-Host "Error while collecting background job outputs: $_"
 }
 Stop-Transcript
+
 
