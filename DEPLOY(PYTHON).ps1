@@ -521,7 +521,6 @@ function Install-VPNProfile {
     }
 }
 
-
 function Install-Office365 {
     $setupPath = Join-Path $folderPath "setup.exe"
     $configPath = Join-Path $folderPath "officesilent.xml"
@@ -533,7 +532,7 @@ function Install-Office365 {
         "/configure", "`"$configPath`""
     )
     Write-Host "Installing Office 365..."
-    Start-Process -FilePath $setupPath -ArgumentList $args -Wait -WindowStyle Hidden
+    Run-Installer -Path $setupPath -Arguments $args -TimeoutSeconds 1800
     
     Write-Host "Office 365 installation complete."
     return $true
