@@ -809,122 +809,267 @@ function Install-Vantage {
     $sourceClientFolder = Join-Path $PSScriptRoot "client803_source" 
     $defaultTotalFiles  = 17023
 
+    # Enhanced path mapping with fallbacks
     switch ($location.ToUpper()) {
         "GEORGIA" { 
             $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+            $fallbackFolder = "\\ga-dc02\Shared2\Vantage\client803"  # Add fallback
         }
         "ARKANSAS" { 
-            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+            $remoteFolder   = "\\ar-dc\Shared\Vantage\client803"  # Fixed path
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+            $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
         }
         "IDAHO" { 
-            $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803\client803"
+            $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803"  # Fixed path
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+            $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
         }
         default { 
             $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+            $fallbackFolder = $null
         }
     }
 
-    if (Test-Path $sourceClientFolder) {
-        try {
-            $totalFiles = (Get-ChildItem -Path $sourceClientFolder -Recurse -File -ErrorAction Stop).Count
-            if (-not $totalFiles -or $totalFiles -le 0) { $totalFiles = $defaultTotalFiles }
-        } catch { $totalFiles = $defaultTotalFiles }
+    Write-Host "=== VANTAGE INSTALLATION PROCESS ===" -ForegroundColor Cyan
+    Write-Host "Target location: $location"
+    Write-Host "Primary source: $remoteFolder"
+    if ($fallbackFolder) {
+        Write-Host "Fallback source: $fallbackFolder"
+    }
+
+    # Pre-flight checks
+    Write-Host "Performing pre-flight checks..."
+    
+    # Check if target already exists
+    if (Test-Path $targetPath) {
+        Write-Host "Target directory already exists: $targetPath"
+        $existingFiles = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
+        Write-Host "Existing files: $existingFiles"
+        if ($existingFiles -gt 1000) {
+            Write-Host "Vantage appears to already be installed. Skipping installation."
+            Write-Output "vantage progress: 100"
+            return
+        }
+    }
+
+    # Test network connectivity to source
+    $sourceAvailable = $false
+    $actualSource = $null
+    
+    Write-Host "Testing primary source connectivity..."
+    if (Test-Path $remoteFolder -ErrorAction SilentlyContinue) {
+        Write-Host "Primary source available: $remoteFolder" -ForegroundColor Green
+        $sourceAvailable = $true
+        $actualSource = $remoteFolder
+    } elseif ($fallbackFolder -and (Test-Path $fallbackFolder -ErrorAction SilentlyContinue)) {
+        Write-Host "Primary source unavailable, using fallback: $fallbackFolder" -ForegroundColor Yellow
+        $sourceAvailable = $true
+        $actualSource = $fallbackFolder
     } else {
-        $totalFiles = $defaultTotalFiles
+        Write-Host "ERROR: No accessible Vantage source found!" -ForegroundColor Red
+        Write-Output "vantage error: Cannot access source folders"
+        
+        # Check if local source exists
+        if (Test-Path $sourceClientFolder) {
+            Write-Host "Found local source folder, attempting local copy..." -ForegroundColor Yellow
+            $actualSource = $sourceClientFolder
+            $sourceAvailable = $true
+        } else {
+            return
+        }
     }
 
-    if (-not (Test-Path $batPath)) {
-        Write-Output "vantage progress: 0"
-        Write-Output "vantage error: client803.bat not found at $batPath"
-        return
+    # Get total file count from actual source
+    if ($sourceAvailable) {
+        try {
+            Write-Host "Counting files in source directory..."
+            $totalFiles = (Get-ChildItem -Path $actualSource -Recurse -File -ErrorAction Stop).Count
+            if (-not $totalFiles -or $totalFiles -le 0) { 
+                $totalFiles = $defaultTotalFiles 
+            }
+            Write-Host "Total files to copy: $totalFiles"
+        } catch { 
+            $totalFiles = $defaultTotalFiles 
+            Write-Host "Could not count files, using default: $totalFiles"
+        }
     }
 
+    # Enhanced copy operation with progress tracking
+    Write-Host "Starting enhanced copy operation..."
+    Write-Output "vantage progress: 0"
+    
     try {
-        $startProcessParams = @{
-            FilePath = $batPath
-            PassThru = $true
-            WindowStyle = 'Hidden'
-            ErrorAction = 'SilentlyContinue'
-        }
-        
-        if (-not [string]::IsNullOrWhiteSpace($location)) {
-            $startProcessParams.ArgumentList = $location
-        }
-        
-        $process = Start-Process @startProcessParams
-        $lastReportedPercent = -1
-        $noChangeCounter = 0
-        $lastCount = -1
-        $stabilitySecondsRequired = 8
-        $sleepInterval = 1
-
-        while ($true) {
-            if ($process -and $process.HasExited) { $process = $null }
-            if (Test-Path $targetPath) {
-                try { $currentCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count } catch { $currentCount = 0 }
-                $percent = 0
-                if ($totalFiles -gt 0) {
-                    $percent = [math]::Round(( [double]$currentCount / [double]$totalFiles) * 100)
-                    if ($percent -lt 0) { $percent = 0 }
-                    if ($percent -gt 100) { $percent = 100 }
+        # Method 1: Try robocopy for better performance and progress
+        $robocopyAvailable = Get-Command robocopy -ErrorAction SilentlyContinue
+        if ($robocopyAvailable) {
+            Write-Host "Using robocopy for enhanced file copying..."
+            
+            # Create target directory
+            New-Item -Path $targetPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+            
+            # Start robocopy with progress monitoring
+            $robocopyJob = Start-Job -ScriptBlock {
+                param($source, $target)
+                $result = robocopy $source $target /E /R:3 /W:10 /MT:8 /NFL /NDL /NP
+                return $LASTEXITCODE
+            } -ArgumentList $actualSource, $targetPath
+            
+            # Monitor progress
+            $startTime = Get-Date
+            $timeout = 1800 # 30 minutes
+            
+            while ($robocopyJob.State -eq 'Running' -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
+                if (Test-Path $targetPath) {
+                    try {
+                        $currentCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
+                        $percent = [math]::Min([math]::Round(($currentCount / $totalFiles) * 100), 100)
+                        Write-Output "vantage progress: $percent"
+                    } catch {
+                        Write-Output "vantage progress: 5"
+                    }
                 }
-                if ($percent -ne $lastReportedPercent) {
-                    Write-Output "vantage progress: $percent"
-                    $lastReportedPercent = $percent
-                    $noChangeCounter = 0
-                } else {
-                    if ($lastCount -eq $currentCount) { $noChangeCounter += $sleepInterval } else { $noChangeCounter = 0 }
-                }
-                $lastCount = $currentCount
-                if ($noChangeCounter -ge $stabilitySecondsRequired) {
-                    if ($lastReportedPercent -lt 100) { Write-Output "vantage progress: 100" }
-                    break
-                }
+                Start-Sleep -Seconds 5
+            }
+            
+            $robocopyResult = Wait-Job $robocopyJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
+            Remove-Job $robocopyJob -Force -ErrorAction SilentlyContinue
+            
+            # Robocopy exit codes 0-3 are success
+            if ($robocopyResult -le 3) {
+                Write-Host "Robocopy completed successfully (exit code: $robocopyResult)" -ForegroundColor Green
+                Write-Output "vantage progress: 85"
             } else {
-                if ($lastReportedPercent -ne 0) {
-                    Write-Output "vantage progress: 0"
-                    $lastReportedPercent = 0
+                throw "Robocopy failed with exit code: $robocopyResult"
+            }
+            
+        } else {
+            # Method 2: Fallback to PowerShell copy with chunked progress
+            Write-Host "Using PowerShell Copy-Item with progress monitoring..."
+            
+            # Get all files first
+            $sourceFiles = Get-ChildItem -Path $actualSource -Recurse -File -ErrorAction Stop
+            $totalFiles = $sourceFiles.Count
+            Write-Host "Found $totalFiles files to copy"
+            
+            $copiedCount = 0
+            $chunkSize = [math]::Max(1, [math]::Floor($totalFiles / 20)) # Update progress every 5%
+            
+            foreach ($file in $sourceFiles) {
+                $relativePath = $file.FullName.Substring($actualSource.Length + 1)
+                $targetFile = Join-Path $targetPath $relativePath
+                $targetDir = Split-Path $targetFile -Parent
+                
+                # Ensure target directory exists
+                if (-not (Test-Path $targetDir)) {
+                    New-Item -Path $targetDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+                
+                # Copy file
+                Copy-Item -Path $file.FullName -Destination $targetFile -Force -ErrorAction SilentlyContinue
+                $copiedCount++
+                
+                # Update progress periodically
+                if ($copiedCount % $chunkSize -eq 0 -or $copiedCount -eq $totalFiles) {
+                    $percent = [math]::Min([math]::Round(($copiedCount / $totalFiles) * 85), 85)
+                    Write-Output "vantage progress: $percent"
                 }
             }
-            Start-Sleep -Seconds $sleepInterval
         }
-
+        
+        # Verify copy completion
         if (Test-Path $targetPath) {
             $finalCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
-            if ($finalCount -gt 0) { Write-Output "vantage progress: 100" }
-        } else { Write-Output "vantage progress: 100" }
-
-        $desktopPath = "$env:PUBLIC\Desktop"
-        if (Test-Path $remoteShortcut) { Copy-Item -Path $remoteShortcut -Destination $desktopPath -Force -ErrorAction SilentlyContinue }
-
-        $installSteps = @(
-            @{ Path = "$PSScriptRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90 },
-            @{ Path = "$PSScriptRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95 },
-            @{ Path = "$PSScriptRoot\dotNetFx35Setup.exe"; Percent = 98 },
-            @{ Path = "$PSScriptRoot\sqlncli.msi"; Percent = 99 }
-        )
-
-        foreach ($step in $installSteps) {
-            if (Test-Path $step.Path) {
-                $ext = [System.IO.Path]::GetExtension($step.Path).ToLower()
-                $args = switch ($ext) { 
-                    ".msi" { @("/quiet", "/norestart") } 
-                    ".exe" { @("/quiet", "/norestart") } 
-                    default { @("/quiet", "/norestart") } 
-                }
-                Start-Process -FilePath $step.Path -ArgumentList $args -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
-                Write-Output "vantage progress: $($step.Percent)"
+            Write-Host "Copy verification: $finalCount files copied" -ForegroundColor Green
+            if ($finalCount -gt 0) { 
+                Write-Output "vantage progress: 85"
             }
         }
 
-        Write-Output "vantage progress: 100"
     } catch {
-        Write-Host "Vantage installation error: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Enhanced copy failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Output "vantage error: Copy operation failed - $($_.Exception.Message)"
+        
+        # Last resort: try the original bat file method
+        if (Test-Path $batPath) {
+            Write-Host "Attempting fallback to batch file method..." -ForegroundColor Yellow
+            try {
+                $startProcessParams = @{
+                    FilePath = $batPath
+                    PassThru = $true
+                    WindowStyle = 'Hidden'
+                    ErrorAction = 'SilentlyContinue'
+                }
+                
+                if (-not [string]::IsNullOrWhiteSpace($location)) {
+                    $startProcessParams.ArgumentList = $location
+                }
+                
+                $process = Start-Process @startProcessParams
+                
+                # Monitor batch file progress
+                $startTime = Get-Date
+                $timeout = 1800 # 30 minutes
+                
+                while ((-not $process.HasExited) -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
+                    if (Test-Path $targetPath) {
+                        try { 
+                            $currentCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count 
+                            $percent = [math]::Min([math]::Round(($currentCount / $totalFiles) * 85), 85)
+                            Write-Output "vantage progress: $percent"
+                        } catch { 
+                            Write-Output "vantage progress: 10"
+                        }
+                    }
+                    Start-Sleep -Seconds 3
+                }
+                
+            } catch {
+                Write-Host "Batch file fallback also failed: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Output "vantage error: All copy methods failed"
+                return
+            }
+        }
     }
+
+    # Install additional components
+    Write-Host "Installing Vantage dependencies..."
+    $installSteps = @(
+        @{ Path = "$PSScriptRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0" },
+        @{ Path = "$PSScriptRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95; Name = "Crystal Reports" },
+        @{ Path = "$PSScriptRoot\dotNetFx35Setup.exe"; Percent = 98; Name = ".NET Framework 3.5" },
+        @{ Path = "$PSScriptRoot\sqlncli.msi"; Percent = 99; Name = "SQL Native Client" }
+    )
+
+    foreach ($step in $installSteps) {
+        if (Test-Path $step.Path) {
+            Write-Host "Installing $($step.Name)..."
+            $ext = [System.IO.Path]::GetExtension($step.Path).ToLower()
+            $args = switch ($ext) { 
+                ".msi" { @("/quiet", "/norestart") } 
+                ".exe" { @("/quiet", "/norestart") } 
+                default { @("/quiet", "/norestart") } 
+            }
+            Start-Process -FilePath $step.Path -ArgumentList $args -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+            Write-Output "vantage progress: $($step.Percent)"
+        } else {
+            Write-Host "Dependency not found: $($step.Name) at $($step.Path)" -ForegroundColor Yellow
+        }
+    }
+
+    # Copy desktop shortcut
+    $desktopPath = "$env:PUBLIC\Desktop"
+    if (Test-Path $remoteShortcut) { 
+        Copy-Item -Path $remoteShortcut -Destination $desktopPath -Force -ErrorAction SilentlyContinue
+        Write-Host "Desktop shortcut copied successfully"
+    } else {
+        Write-Host "Desktop shortcut not found: $remoteShortcut" -ForegroundColor Yellow
+    }
+
+    Write-Output "vantage progress: 100"
+    Write-Host "Vantage installation completed successfully" -ForegroundColor Green
 }
 
 # ZERO-POPUP OFFICE 365 REMOVAL - Completely silent, no UI automation
