@@ -1230,7 +1230,7 @@ function Remove-Office365 {
 }
 
 function Install-AdobeReader {
-    # ZERO-POPUP Adobe installation with multiple fallback methods
+    # ZERO-POPUP Adobe installation with multiple fallback methods AND MSP patch application
     $msiPath = Join-Path $PSScriptRoot "AcroRead.msi"
     $mstPath = Join-Path $PSScriptRoot "AcroRead.mst"
     $mspPath = Join-Path $PSScriptRoot "AcroRdrDCUpd2500120693.msp"
@@ -1241,27 +1241,61 @@ function Install-AdobeReader {
         return $false 
     }
     
-    Write-Host "Starting Adobe Reader installation with error 1624 fixes..."
+    $hasPatch = Test-Path $mspPath
+    if ($hasPatch) {
+        Write-Host "MSP patch file found: $mspPath"
+    }
+    
+    Write-Host "Starting Adobe Reader installation with error 1624 fixes and patch application..."
 
-    # Method 1: Try without transform first (fixes many 1624 errors) - COMPLETELY SILENT
+    # Method 1: Try installation with patch included (if available) - COMPLETELY SILENT
+    if ($hasPatch) {
+        try {
+            Write-Host "Attempting installation with integrated patch (Method 1)..."
+            $patchArgs = @("/i", "`"$msiPath`"", "PATCH=`"$mspPath`"", "/qn", "/norestart", "ALLUSERS=1", "EULA_ACCEPT=YES", "SUPPRESS_APP_LAUNCH=YES")
+            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -Wait -PassThru -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
+            
+            if ($process.ExitCode -eq 0) {
+                Write-Host "Adobe Reader installed successfully with patch (Method 1)" -ForegroundColor Green
+                return $true
+            }
+            Write-Host "Method 1 failed with exit code: $($process.ExitCode)"
+        } catch {
+            Write-Host "Method 1 failed with exception: $($_.Exception.Message)"
+        }
+    }
+
+    # Method 2: Try without transform first (fixes many 1624 errors) - COMPLETELY SILENT
     try {
-        Write-Host "Attempting installation without transform (Method 1)..."
+        Write-Host "Attempting installation without transform (Method 2)..."
         $simpleArgs = @("/i", "`"$msiPath`"", "/qn", "/norestart", "ALLUSERS=1", "EULA_ACCEPT=YES", "SUPPRESS_APP_LAUNCH=YES")
         $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $simpleArgs -Wait -PassThru -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
         
         if ($process.ExitCode -eq 0) {
-            Write-Host "Adobe Reader installed successfully (Method 1)" -ForegroundColor Green
+            Write-Host "Adobe Reader base installation successful (Method 2)" -ForegroundColor Green
+            
+            # Apply patch after installation if available
+            if ($hasPatch) {
+                Write-Host "Applying MSP patch..."
+                if (Apply-MSPatch -MspPath $mspPath) {
+                    Write-Host "Adobe Reader installation and patch completed successfully" -ForegroundColor Green
+                    return $true
+                } else {
+                    Write-Host "Base installation succeeded but patch failed" -ForegroundColor Yellow
+                    return $true  # Still return true since base install worked
+                }
+            }
             return $true
         }
-        Write-Host "Method 1 failed with exit code: $($process.ExitCode)"
+        Write-Host "Method 2 failed with exit code: $($process.ExitCode)"
     } catch {
-        Write-Host "Method 1 failed with exception: $($_.Exception.Message)"
+        Write-Host "Method 2 failed with exception: $($_.Exception.Message)"
     }
 
-    # Method 2: Try with transform but fix common path issues - COMPLETELY SILENT
+    # Method 3: Try with transform but fix common path issues - COMPLETELY SILENT
     if (Test-Path $mstPath) {
         try {
-            Write-Host "Attempting installation with transform (Method 2)..."
+            Write-Host "Attempting installation with transform (Method 3)..."
             # Copy files to temp to avoid path issues
             $tempDir = Join-Path $env:TEMP "AdobeInstall"
             New-Item -Path $tempDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
@@ -1269,27 +1303,58 @@ function Install-AdobeReader {
             Copy-Item $msiPath "$tempDir\AcroRead.msi" -Force -ErrorAction SilentlyContinue
             Copy-Item $mstPath "$tempDir\AcroRead.mst" -Force -ErrorAction SilentlyContinue
             if (Test-Path $cabPath) { Copy-Item $cabPath "$tempDir\Data1.cab" -Force -ErrorAction SilentlyContinue }
+            if ($hasPatch) { Copy-Item $mspPath "$tempDir\AcroRead.msp" -Force -ErrorAction SilentlyContinue }
             
             Push-Location $tempDir -ErrorAction SilentlyContinue
+            
+            # Try with patch integrated first
+            if ($hasPatch) {
+                $transformPatchArgs = @("/i", "AcroRead.msi", "TRANSFORMS=AcroRead.mst", "PATCH=AcroRead.msp", "/qn", "/norestart", "ALLUSERS=1")
+                $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $transformPatchArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                
+                if ($process.ExitCode -eq 0) {
+                    Write-Host "Adobe Reader installed successfully with transform and patch (Method 3a)" -ForegroundColor Green
+                    Pop-Location -ErrorAction SilentlyContinue
+                    Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+                    return $true
+                }
+            }
+            
+            # Try without patch
             $transformArgs = @("/i", "AcroRead.msi", "TRANSFORMS=AcroRead.mst", "/qn", "/norestart", "ALLUSERS=1")
             $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $transformArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
             Pop-Location -ErrorAction SilentlyContinue
             
             if ($process.ExitCode -eq 0) {
-                Write-Host "Adobe Reader installed successfully (Method 2)" -ForegroundColor Green
+                Write-Host "Adobe Reader base installation with transform successful (Method 3b)" -ForegroundColor Green
+                
+                # Apply patch after installation if available
+                if ($hasPatch) {
+                    Write-Host "Applying MSP patch..."
+                    $tempMspPath = Join-Path $tempDir "AcroRead.msp"
+                    if (Apply-MSPatch -MspPath $tempMspPath) {
+                        Write-Host "Adobe Reader installation with transform and patch completed successfully" -ForegroundColor Green
+                        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+                        return $true
+                    } else {
+                        Write-Host "Base installation with transform succeeded but patch failed" -ForegroundColor Yellow
+                        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+                        return $true  # Still return true since base install worked
+                    }
+                }
                 Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
                 return $true
             }
-            Write-Host "Method 2 failed with exit code: $($process.ExitCode)"
+            Write-Host "Method 3 failed with exit code: $($process.ExitCode)"
             Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         } catch {
-            Write-Host "Method 2 failed with exception: $($_.Exception.Message)"
+            Write-Host "Method 3 failed with exception: $($_.Exception.Message)"
         }
     }
 
-    # Method 3: Repair Windows Installer and retry - COMPLETELY SILENT
+    # Method 4: Repair Windows Installer and retry - COMPLETELY SILENT
     try {
-        Write-Host "Attempting Windows Installer repair and retry (Method 3)..."
+        Write-Host "Attempting Windows Installer repair and retry (Method 4)..."
         Restart-Service -Name "msiserver" -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
         
@@ -1297,34 +1362,108 @@ function Install-AdobeReader {
         $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $repairArgs -Wait -PassThru -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
         
         if ($process.ExitCode -eq 0) {
-            Write-Host "Adobe Reader installed successfully (Method 3)" -ForegroundColor Green
+            Write-Host "Adobe Reader repair installation successful (Method 4)" -ForegroundColor Green
+            
+            # Apply patch after repair if available
+            if ($hasPatch) {
+                Write-Host "Applying MSP patch after repair..."
+                if (Apply-MSPatch -MspPath $mspPath) {
+                    Write-Host "Adobe Reader repair and patch completed successfully" -ForegroundColor Green
+                    return $true
+                } else {
+                    Write-Host "Repair installation succeeded but patch failed" -ForegroundColor Yellow
+                    return $true  # Still return true since repair worked
+                }
+            }
             return $true
         }
-        Write-Host "Method 3 failed with exit code: $($process.ExitCode)"
+        Write-Host "Method 4 failed with exit code: $($process.ExitCode)"
     } catch {
-        Write-Host "Method 3 failed with exception: $($_.Exception.Message)"
+        Write-Host "Method 4 failed with exception: $($_.Exception.Message)"
     }
 
-    # Method 4: Extract and install manually if it's an EXE disguised as MSI - COMPLETELY SILENT
+    # Method 5: Extract and install manually if it's an EXE disguised as MSI - COMPLETELY SILENT
     try {
-        Write-Host "Attempting direct executable installation (Method 4)..."
+        Write-Host "Attempting direct executable installation (Method 5)..."
         # Look for EXE version
         $exePath = Join-Path $PSScriptRoot "AcroRead.exe"
         if (Test-Path $exePath) {
             $process = Start-Process -FilePath $exePath -ArgumentList "/sAll", "/rs", "/msi" -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
             if ($process.ExitCode -eq 0) {
-                Write-Host "Adobe Reader installed successfully (Method 4)" -ForegroundColor Green
+                Write-Host "Adobe Reader executable installation successful (Method 5)" -ForegroundColor Green
+                
+                # Apply patch after exe install if available
+                if ($hasPatch) {
+                    Write-Host "Applying MSP patch after executable installation..."
+                    if (Apply-MSPatch -MspPath $mspPath) {
+                        Write-Host "Adobe Reader executable installation and patch completed successfully" -ForegroundColor Green
+                        return $true
+                    } else {
+                        Write-Host "Executable installation succeeded but patch failed" -ForegroundColor Yellow
+                        return $true  # Still return true since exe install worked
+                    }
+                }
                 return $true
             }
         }
     } catch {
-        Write-Host "Method 4 failed with exception: $($_.Exception.Message)"
+        Write-Host "Method 5 failed with exception: $($_.Exception.Message)"
     }
 
     Write-Host "All Adobe Reader installation methods failed. Manual installation may be required." -ForegroundColor Red
     return $false
 }
 
+function Apply-MSPatch {
+    param([string]$MspPath)
+    
+    if (-not (Test-Path $MspPath)) {
+        Write-Host "MSP patch file not found: $MspPath" -ForegroundColor Red
+        return $false
+    }
+    
+    try {
+        Write-Host "Applying MSP patch: $MspPath"
+        
+        # Method 1: Apply patch directly
+        $patchArgs = @("/p", "`"$MspPath`"", "/qn", "/norestart")
+        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+        
+        if ($process.ExitCode -eq 0) {
+            Write-Host "MSP patch applied successfully" -ForegroundColor Green
+            return $true
+        }
+        
+        Write-Host "Direct patch application failed with exit code: $($process.ExitCode)"
+        
+        # Method 2: Try to identify the product and apply patch
+        $adobeProducts = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Adobe*Reader*" -or $_.Name -like "*Acrobat*Reader*" }
+        
+        if ($adobeProducts) {
+            foreach ($product in $adobeProducts) {
+                try {
+                    Write-Host "Attempting to patch product: $($product.Name)"
+                    $productPatchArgs = @("/p", "`"$MspPath`"", "/qn", "/norestart", "TARGETPRODUCT=$($product.IdentifyingNumber)")
+                    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $productPatchArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                    
+                    if ($process.ExitCode -eq 0) {
+                        Write-Host "MSP patch applied successfully to $($product.Name)" -ForegroundColor Green
+                        return $true
+                    }
+                } catch {
+                    Write-Host "Failed to patch $($product.Name): $($_.Exception.Message)"
+                }
+            }
+        }
+        
+        Write-Host "MSP patch application failed" -ForegroundColor Red
+        return $false
+        
+    } catch {
+        Write-Host "MSP patch application failed with exception: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
 function Install-VPN {
     $vpnInstaller = Join-Path $PSScriptRoot "silent.bat"
 
@@ -1682,10 +1821,8 @@ function Complete-Deployment {
     }
 }
 
-# RESTORED FULL MAIN EXECUTION WITH FILE STAGING
 Write-Host "=== PSI DEPLOYMENT TOOL - ZERO-POPUP FULL FEATURED VERSION ===" -ForegroundColor Green
 
-# RESTORED: Pre-stage all files for maximum speed
 Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Pre-staging installation files"
 $localStage = "C:\DeployStage"
 New-Item -Path $localStage -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
@@ -1696,7 +1833,6 @@ $PSScriptRoot = $localStage
 
 Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone (parallel)"
 
-# RESTORED: Start credential loading in background while doing other tasks
 $credentialJob = Start-Job -ScriptBlock {
     param($scriptDir)
     function Get-DomainCredential {
@@ -1723,16 +1859,13 @@ $credentialJob = Start-Job -ScriptBlock {
     return Get-DomainCredential -ScriptDirectory $scriptDir
 } -ArgumentList $originalPSScriptRoot
 
-# Configure timezone while credential loads
 Set-TimeZoneFromUserInput
 
-# Get credentials from background job
 $Credential = Wait-Job $credentialJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
 Remove-Job $credentialJob -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 3 -TotalSteps 15 -StepDescription "Domain operations (parallel with software installation)"
 
-# RESTORED: Start domain operations in background
 $domainJob = Start-Job -ScriptBlock {
     param($location, $computerName, $credential)
     
