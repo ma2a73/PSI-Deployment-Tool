@@ -6,12 +6,10 @@ param(
     [switch]$installVANTAGE
 )
 
-# Global variables for tracking state
 $script:DefenderDisabled = $false
 $script:OriginalPowerPlan = $null
 $script:DeploymentStartTime = Get-Date
 
-# SILENT ERROR HANDLING - Ensure no popups ever appear
 $ErrorActionPreference = "SilentlyContinue"
 $WarningPreference = "SilentlyContinue"
 $VerbosePreference = "SilentlyContinue"
@@ -28,17 +26,14 @@ $localLogPath = Join-Path $localLogDirectory $logFileName
 
 Start-Transcript -Path $localLogPath -NoClobber
 
-# ZERO-POPUP PERFORMANCE OPTIMIZATION - All operations are completely silent
 function Optimize-DeploymentPerformance {
     Write-Host "=== OPTIMIZING SYSTEM FOR DEPLOYMENT SPEED ===" -ForegroundColor Cyan
     
     try {
-        # Set process priority to high for this script
         $currentProcess = Get-Process -Id $PID
         $currentProcess.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
         Write-Host "Set deployment process priority to HIGH"
         
-        # Store original power plan and set to high performance
         try {
             $script:OriginalPowerPlan = (powercfg /getactivescheme) -replace '.*GUID: ([a-f0-9\-]+).*', '$1'
             $highPerf = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"  # High Performance GUID
@@ -48,7 +43,6 @@ function Optimize-DeploymentPerformance {
             Write-Host "Power plan optimization skipped"
         }
         
-        # SILENT Windows Defender disabling - No notifications
         try {
             $defenderSettings = Get-MpPreference -ErrorAction SilentlyContinue
             if ($defenderSettings -and $defenderSettings.DisableRealtimeMonitoring -eq $false) {
@@ -57,20 +51,16 @@ function Optimize-DeploymentPerformance {
                 Write-Host "Temporarily disabled Windows Defender real-time scanning (silent)"
             }
         } catch {
-            # Completely silent - no output
         }
         
-        # Silent visual effects optimization
         try {
             $visualEffectsPath = "HKCU:\Control Panel\Desktop"
             Set-ItemProperty -Path $visualEffectsPath -Name "DragFullWindows" -Value "0" -ErrorAction SilentlyContinue
             Set-ItemProperty -Path $visualEffectsPath -Name "MenuShowDelay" -Value "0" -ErrorAction SilentlyContinue
             Set-ItemProperty -Path $visualEffectsPath -Name "UserPreferencesMask" -Value ([byte[]](0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00)) -ErrorAction SilentlyContinue
         } catch {
-            # Silent failure
         }
         
-        # SILENT service optimization - No prompts
         $servicesToOptimize = @("Themes", "TabletInputService", "Fax")
         foreach ($service in $servicesToOptimize) {
             try {
@@ -80,66 +70,52 @@ function Optimize-DeploymentPerformance {
                     Write-Host "Temporarily stopped service: $service"
                 }
             } catch {
-                # Silent failure
             }
         }
         
-        # Silent registry optimizations for faster file operations
         try {
             Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "NtfsDisableLastAccessUpdate" -Value 1 -ErrorAction SilentlyContinue
         } catch {
-            # Silent failure
         }
         
-        # Network optimizations
         try {
             [System.Net.ServicePointManager]::DefaultConnectionLimit = 100
             [System.Net.ServicePointManager]::Expect100Continue = $false
             [System.Net.ServicePointManager]::UseNagleAlgorithm = $false
         } catch {
-            # Silent failure
         }
         
         Write-Host "Performance optimization completed - deployment should run significantly faster" -ForegroundColor Green
         
     } catch {
-        # Silent failure - no warnings displayed
     }
 }
 
-# ZERO-POPUP REMOTE MANAGEMENT - All operations completely silent
 function Enable-RemoteManagement {
     Write-Host "=== ENABLING REMOTE MANAGEMENT ===" -ForegroundColor Cyan
     
     try {
-        # Enable PowerShell Remoting silently
         try {
             Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null
             Set-WSManInstance -ResourceURI winrm/config/service -ValueSet @{AllowUnencrypted="false"} -ErrorAction SilentlyContinue | Out-Null
             Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Basic="true"} -ErrorAction SilentlyContinue | Out-Null
             Write-Host "PowerShell Remoting enabled"
         } catch {
-            # Silent failure
         }
         
-        # Configure WinRM silently
         try {
             Set-WSManInstance -ResourceURI winrm/config -ValueSet @{MaxTimeoutms="1800000"} -ErrorAction SilentlyContinue | Out-Null
             Set-WSManInstance -ResourceURI winrm/config/winrs -ValueSet @{MaxMemoryPerShellMB="2048"} -ErrorAction SilentlyContinue | Out-Null
         } catch {
-            # Silent failure
         }
         
-        # Enable RDP silently
         try {
             Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
             Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
             Write-Host "Remote Desktop enabled"
         } catch {
-            # Silent failure
         }
         
-        # Enable firewall rules silently
         $firewallRules = @(
             "Windows Management Instrumentation (WMI)",
             "Windows Remote Management",
@@ -151,26 +127,22 @@ function Enable-RemoteManagement {
             try {
                 Enable-NetFirewallRule -DisplayGroup $rule -ErrorAction SilentlyContinue
             } catch {
-                # Silent failure
             }
         }
         Write-Host "Firewall rules enabled for remote management"
         
-        # Start and configure services silently
         $services = @("WinRM", "TermService", "Winmgmt")
         foreach ($service in $services) {
             try {
                 Set-Service $service -StartupType Automatic -ErrorAction SilentlyContinue
                 Start-Service $service -ErrorAction SilentlyContinue
             } catch {
-                # Silent failure
             }
         }
         
         Write-Host "Remote management configuration completed" -ForegroundColor Green
         
     } catch {
-        # Silent failure
     }
 }
 
@@ -192,7 +164,6 @@ function Write-DeploymentProgress {
     }
 }
 
-# ZERO-POPUP Parameter validation - Use defaults instead of throwing errors
 if (-not $timezone) { 
     $timezone = "EASTERN"
     Write-Host "Using default timezone: $timezone" -ForegroundColor Yellow
@@ -214,7 +185,6 @@ if (-not $computerName) {
     Write-Host "Received Computer Name: $computerName" 
 }
 
-# RUN OPTIMIZATIONS IMMEDIATELY
 Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Optimizing system performance for deployment"
 Optimize-DeploymentPerformance
 
@@ -340,7 +310,6 @@ function Join-DomainBasedOnLocation {
         return $false
     }
     
-    # Test network connectivity first
     if (-not (Test-NetworkConnectivity -Location $Location)) {
         Write-Host "Network connectivity issues detected - domain join may fail" -ForegroundColor Yellow
     }
@@ -483,7 +452,7 @@ function Run-Installer {
             return $true
         } else {
             Write-Host "Installer completed with exit code $($process.ExitCode): $Path" -ForegroundColor Yellow
-            return $true  # Many installers return non-zero but still succeed
+            return $true 
         }
     } catch {
         Write-Host "Installer failed: $Path - $($_.Exception.Message)" -ForegroundColor Red
@@ -571,7 +540,6 @@ function Enable-DotNetFramework {
             Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -LimitAccess -Source $sxsSource -ErrorAction SilentlyContinue | Out-Null
         }
 
-        # Use Start-Process to ensure completely silent operation
         Start-Process -FilePath "DISM.exe" -ArgumentList "/Online", "/Enable-Feature", "/FeatureName:NetFx3", "/All", "/NoRestart", "/Quiet" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
         Write-Host ".NET Framework installation initiated silently."
         return $true
@@ -581,13 +549,11 @@ function Enable-DotNetFramework {
     }
 }
 
-# RESTORED PARALLEL INSTALLATION FUNCTION - Zero popup version
 function Start-ParallelInstallations {
     Write-Host "=== STARTING PARALLEL INSTALLATIONS ===" -ForegroundColor Cyan
     
     $jobs = @()
     
-    # TeamViewer installation job - completely silent
     $tvJob = Start-Job -Name "TeamViewer" -ScriptBlock {
         param($scriptRoot)
         $tvPath = Join-Path $scriptRoot "Teamviewer_Setup.exe"
@@ -604,7 +570,6 @@ function Start-ParallelInstallations {
     } -ArgumentList $PSScriptRoot
     $jobs += $tvJob
     
-    # CrowdStrike installation job - completely silent
     $csJob = Start-Job -Name "CrowdStrike" -ScriptBlock {
         param($scriptRoot)
         $csPath = Join-Path $scriptRoot "WindowsSensor.MaverickGyr.exe"
@@ -621,7 +586,6 @@ function Start-ParallelInstallations {
     } -ArgumentList $PSScriptRoot
     $jobs += $csJob
     
-    # .NET Framework installation job - completely silent
     $dotnetJob = Start-Job -Name "DotNet" -ScriptBlock {
         try {
             Start-Process -FilePath "DISM.exe" -ArgumentList "/Online", "/Enable-Feature", "/FeatureName:NetFx3", "/All", "/NoRestart", "/Quiet" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
@@ -632,7 +596,6 @@ function Start-ParallelInstallations {
     }
     $jobs += $dotnetJob
     
-    # System features job - completely silent
     $featuresJob = Start-Job -Name "Features" -ScriptBlock {
         try {
             Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
@@ -647,7 +610,6 @@ function Start-ParallelInstallations {
     
     Write-Host "Started $($jobs.Count) parallel installation jobs" -ForegroundColor Green
     
-    # Wait for jobs with timeout and progress
     $timeout = 300  # 5 minutes
     $startTime = Get-Date
     
@@ -666,7 +628,6 @@ function Start-ParallelInstallations {
         }
     }
     
-    # Force cleanup any remaining jobs
     $jobs | ForEach-Object {
         Stop-Job -Job $_ -ErrorAction SilentlyContinue
         Remove-Job -Job $_ -Force -ErrorAction SilentlyContinue
@@ -675,7 +636,6 @@ function Start-ParallelInstallations {
     Write-Host "Parallel installations completed" -ForegroundColor Green
 }
 
-# RESTORED BACKGROUND INSTALLER FUNCTION
 function Start-BackgroundInstaller {
     param(
         [Parameter(Mandatory=$true)] [string]$Path,
@@ -809,7 +769,6 @@ function Install-Vantage {
     $sourceClientFolder = Join-Path $PSScriptRoot "client803_source" 
     $defaultTotalFiles  = 17023
 
-    # Enhanced path mapping with fallbacks
     switch ($location.ToUpper()) {
         "GEORGIA" { 
             $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
@@ -840,10 +799,8 @@ function Install-Vantage {
         Write-Host "Fallback source: $fallbackFolder"
     }
 
-    # Pre-flight checks
     Write-Host "Performing pre-flight checks..."
     
-    # Check if target already exists
     if (Test-Path $targetPath) {
         Write-Host "Target directory already exists: $targetPath"
         $existingFiles = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
@@ -855,7 +812,6 @@ function Install-Vantage {
         }
     }
 
-    # Test network connectivity to source
     $sourceAvailable = $false
     $actualSource = $null
     
@@ -872,7 +828,6 @@ function Install-Vantage {
         Write-Host "ERROR: No accessible Vantage source found!" -ForegroundColor Red
         Write-Output "vantage error: Cannot access source folders"
         
-        # Check if local source exists
         if (Test-Path $sourceClientFolder) {
             Write-Host "Found local source folder, attempting local copy..." -ForegroundColor Yellow
             $actualSource = $sourceClientFolder
@@ -882,7 +837,6 @@ function Install-Vantage {
         }
     }
 
-    # Get total file count from actual source
     if ($sourceAvailable) {
         try {
             Write-Host "Counting files in source directory..."
@@ -897,27 +851,22 @@ function Install-Vantage {
         }
     }
 
-    # Enhanced copy operation with progress tracking
     Write-Host "Starting enhanced copy operation..."
     Write-Output "vantage progress: 0"
     
     try {
-        # Method 1: Try robocopy for better performance and progress
         $robocopyAvailable = Get-Command robocopy -ErrorAction SilentlyContinue
         if ($robocopyAvailable) {
             Write-Host "Using robocopy for enhanced file copying..."
             
-            # Create target directory
             New-Item -Path $targetPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
             
-            # Start robocopy with progress monitoring
             $robocopyJob = Start-Job -ScriptBlock {
                 param($source, $target)
                 $result = robocopy $source $target /E /R:3 /W:10 /MT:8 /NFL /NDL /NP
                 return $LASTEXITCODE
             } -ArgumentList $actualSource, $targetPath
             
-            # Monitor progress
             $startTime = Get-Date
             $timeout = 1800 # 30 minutes
             
@@ -937,7 +886,6 @@ function Install-Vantage {
             $robocopyResult = Wait-Job $robocopyJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
             Remove-Job $robocopyJob -Force -ErrorAction SilentlyContinue
             
-            # Robocopy exit codes 0-3 are success
             if ($robocopyResult -le 3) {
                 Write-Host "Robocopy completed successfully (exit code: $robocopyResult)" -ForegroundColor Green
                 Write-Output "vantage progress: 85"
@@ -946,10 +894,8 @@ function Install-Vantage {
             }
             
         } else {
-            # Method 2: Fallback to PowerShell copy with chunked progress
             Write-Host "Using PowerShell Copy-Item with progress monitoring..."
             
-            # Get all files first
             $sourceFiles = Get-ChildItem -Path $actualSource -Recurse -File -ErrorAction Stop
             $totalFiles = $sourceFiles.Count
             Write-Host "Found $totalFiles files to copy"
@@ -962,16 +908,13 @@ function Install-Vantage {
                 $targetFile = Join-Path $targetPath $relativePath
                 $targetDir = Split-Path $targetFile -Parent
                 
-                # Ensure target directory exists
                 if (-not (Test-Path $targetDir)) {
                     New-Item -Path $targetDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
                 }
                 
-                # Copy file
                 Copy-Item -Path $file.FullName -Destination $targetFile -Force -ErrorAction SilentlyContinue
                 $copiedCount++
                 
-                # Update progress periodically
                 if ($copiedCount % $chunkSize -eq 0 -or $copiedCount -eq $totalFiles) {
                     $percent = [math]::Min([math]::Round(($copiedCount / $totalFiles) * 85), 85)
                     Write-Output "vantage progress: $percent"
@@ -979,7 +922,6 @@ function Install-Vantage {
             }
         }
         
-        # Verify copy completion
         if (Test-Path $targetPath) {
             $finalCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
             Write-Host "Copy verification: $finalCount files copied" -ForegroundColor Green
@@ -992,7 +934,6 @@ function Install-Vantage {
         Write-Host "Enhanced copy failed: $($_.Exception.Message)" -ForegroundColor Red
         Write-Output "vantage error: Copy operation failed - $($_.Exception.Message)"
         
-        # Last resort: try the original bat file method
         if (Test-Path $batPath) {
             Write-Host "Attempting fallback to batch file method..." -ForegroundColor Yellow
             try {
@@ -1009,7 +950,6 @@ function Install-Vantage {
                 
                 $process = Start-Process @startProcessParams
                 
-                # Monitor batch file progress
                 $startTime = Get-Date
                 $timeout = 1800 # 30 minutes
                 
@@ -1034,7 +974,6 @@ function Install-Vantage {
         }
     }
 
-    # Install additional components
     Write-Host "Installing Vantage dependencies..."
     $installSteps = @(
         @{ Path = "$PSScriptRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0" },
@@ -1059,7 +998,6 @@ function Install-Vantage {
         }
     }
 
-    # Copy desktop shortcut
     $desktopPath = "$env:PUBLIC\Desktop"
     if (Test-Path $remoteShortcut) { 
         Copy-Item -Path $remoteShortcut -Destination $desktopPath -Force -ErrorAction SilentlyContinue
@@ -1072,7 +1010,6 @@ function Install-Vantage {
     Write-Host "Vantage installation completed successfully" -ForegroundColor Green
 }
 
-# ZERO-POPUP OFFICE 365 REMOVAL - Completely silent, no UI automation
 function Remove-Office365 {
     [CmdletBinding()]
     param(
@@ -1100,11 +1037,9 @@ function Remove-Office365 {
         
         $installedOffice = @()
         try {
-            # Use WMI for better compatibility and no popups
             $installedOffice = Get-WmiObject -Class Win32_Product -ErrorAction SilentlyContinue | 
                 Where-Object { $_.Name -match "^Microsoft.*Office|^Microsoft.*365|^Microsoft.*OneNote|^Microsoft.*Teams|^Office.*Professional|^Office.*Standard" }
         } catch {
-            # Silent fallback to registry
         }
         
         if ($installedOffice) {
@@ -1122,7 +1057,6 @@ function Remove-Office365 {
                     $appxOffice | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor White }
                 }
             } catch {
-                # Silent failure
             }
         }
         
@@ -1141,7 +1075,6 @@ function Remove-Office365 {
         }
         
         if ($killedProcs.Count -gt 0) {
-            # FIXED: Use proper if-else instead of problematic ternary syntax
             if ($WhatIf) {
                 $actionText = "Would kill"
             } else {
@@ -1160,7 +1093,6 @@ function Remove-Office365 {
         foreach ($svc in $services) {
             $service = Get-Service -Name $svc -ErrorAction SilentlyContinue
             if ($service) {
-                # FIXED: Use proper if-else instead of problematic ternary syntax
                 if ($WhatIf) {
                     $actionText = "Would manage"
                 } else {
@@ -1176,7 +1108,6 @@ function Remove-Office365 {
             }
         }
         
-        # COMPLETELY SILENT ClickToRun removal - NO UI automation
         Write-Host "Step 4: ClickToRun removal..." -ForegroundColor Yellow
         $clickToRunPaths = @()
         
@@ -1189,7 +1120,6 @@ function Remove-Office365 {
         }
         
         foreach ($path in $clickToRunPaths) {
-            # FIXED: Use proper if-else instead of problematic ternary syntax
             if ($WhatIf) {
                 $actionText = "Would use"
             } else {
@@ -1198,7 +1128,6 @@ function Remove-Office365 {
             Write-Host "$actionText ClickToRun at: $path" -ForegroundColor Cyan
             if (-not $WhatIf) {
                 try {
-                    # MAXIMUM silent parameters - NO UI automation needed
                     $ctrArgs = @(
                         "scenario=install",
                         "scenariosubtype=ARP", 
@@ -1218,12 +1147,10 @@ function Remove-Office365 {
             }
         }
         
-        # Silent UWP app removal
         if ($isWindows8Plus -and $appxOffice) {
             Write-Host "Step 5: UWP app removal..." -ForegroundColor Yellow
             
             foreach ($app in $appxOffice) {
-                # FIXED: Use proper if-else instead of problematic ternary syntax
                 if ($WhatIf) {
                     $actionText = "Would remove"
                 } else {
@@ -1235,7 +1162,6 @@ function Remove-Office365 {
                         Remove-AppxPackage -Package $app.PackageFullName -AllUsers -ErrorAction SilentlyContinue
                         Write-Host "Successfully removed: $($app.Name)" -ForegroundColor Green
                     } catch {
-                        # Silent failure
                     }
                 }
             }
@@ -1246,7 +1172,6 @@ function Remove-Office365 {
                     $provisionedApps = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | 
                         Where-Object { $_.DisplayName -like $pattern }
                     foreach ($app in $provisionedApps) {
-                        # FIXED: Use proper if-else instead of problematic ternary syntax
                         if ($WhatIf) {
                             $actionText = "Would remove"
                         } else {
@@ -1261,7 +1186,6 @@ function Remove-Office365 {
             }
         }
         
-        # COMPLETELY SILENT WMI-based uninstall - NO popups
         Write-Host "Step 6: Silent WMI-based uninstall..." -ForegroundColor Yellow
         
         if ($installedOffice -and -not $WhatIf) {
@@ -1272,15 +1196,12 @@ function Remove-Office365 {
                     $product.Uninstall() | Out-Null
                     Write-Host "Successfully removed: $($product.DisplayName)" -ForegroundColor Green
                 } catch {
-                    # Silent failure - no popups
                 }
                 
-                # Brief pause between uninstalls
                 Start-Sleep -Seconds 1
             }
         }
         
-        # Silent file system cleanup
         Write-Host "Step 7: File system cleanup..." -ForegroundColor Yellow
         
         $basePaths = @()
@@ -1305,7 +1226,6 @@ function Remove-Office365 {
                 if (Test-Path $parentPath) {
                     $matchingPaths = Get-ChildItem -Path $parentPath -Filter $filter -ErrorAction SilentlyContinue
                     foreach ($matchingPath in $matchingPaths) {
-                        # FIXED: Use proper if-else instead of problematic ternary syntax
                         if ($WhatIf) {
                             $actionText = "Would remove"
                         } else {
@@ -1319,7 +1239,6 @@ function Remove-Office365 {
                 }
             } else {
                 if (Test-Path $path) {
-                    # FIXED: Use proper if-else instead of problematic ternary syntax
                     if ($WhatIf) {
                         $actionText = "Would remove"
                     } else {
@@ -1333,7 +1252,6 @@ function Remove-Office365 {
             }
         }
         
-        # Silent registry cleanup
         Write-Host "Step 8: Registry cleanup..." -ForegroundColor Yellow
         
         $regPaths = @(
@@ -1350,7 +1268,6 @@ function Remove-Office365 {
         
         foreach ($regPath in $regPaths) {
             if (Test-Path $regPath) {
-                # FIXED: Use proper if-else instead of problematic ternary syntax
                 if ($WhatIf) {
                     $actionText = "Would remove"
                 } else {
@@ -1369,7 +1286,6 @@ function Remove-Office365 {
         }
     }
     catch {
-        # Silent error handling - no popups
         Write-Host "Office removal encountered an error but continuing deployment" -ForegroundColor Yellow
     }
 }
@@ -1677,7 +1593,6 @@ function Install-Office365 {
     return $result
 }
 
-# RESTORED VERIFICATION FUNCTION - Background job version
 function Verify-Installations {
     $reported = @{
         TeamViewer = $false
@@ -1723,16 +1638,12 @@ function Verify-Installations {
     return $verificationJob
 }
 
-# RESTORED ADVANCED WINDOWS UPDATES - Parallel processing version
 function Run-WindowsUpdates {
     try {
         Write-Output "winupdate progress: 0"
         Write-Host "Starting OPTIMIZED Windows Updates process..." -ForegroundColor Cyan
 
-        # SPEED OPTIMIZATION: Use faster update methods
-        # Method 1: Try Windows Update Assistant (fastest for major updates)
         try {
-            # Check if Windows Update Assistant is available
             $wuaPath = Join-Path $PSScriptRoot "Windows10Upgrade9252.exe"
             if (Test-Path $wuaPath) {
                 Write-Host "Using Windows Update Assistant for faster updates..."
@@ -1743,7 +1654,6 @@ function Run-WindowsUpdates {
             Write-Host "Windows Update Assistant not available, using alternative method"
         }
 
-        # Method 2: Use UsoClient (Windows Update Service Orchestrator) - Much faster than PSWindowsUpdate
         try {
             Write-Host "Triggering Windows Update scan using UsoClient (fastest method)..."
             Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
@@ -1762,16 +1672,12 @@ function Run-WindowsUpdates {
             Write-Host "UsoClient method failed, falling back to PSWindowsUpdate"
         }
 
-        # Method 3: Optimized PSWindowsUpdate (fallback method) - ZERO POPUP VERSION
         Write-Host "Using optimized PSWindowsUpdate module..."
         
-        # Install required modules in parallel background job to save time
         $moduleJob = Start-Job -ScriptBlock {
             try {
-                # Use faster TLS settings
                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
                 
-                # Install with minimal validation for speed - COMPLETELY SILENT
                 Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -MinimumVersion 2.8.5.201 -ErrorAction SilentlyContinue | Out-Null
                 Install-Module -Name PSWindowsUpdate -SkipPublisherCheck -Force -Scope CurrentUser -AllowClobber -ErrorAction SilentlyContinue | Out-Null
                 return $true
@@ -1791,7 +1697,6 @@ function Run-WindowsUpdates {
         Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
         Write-Output "winupdate progress: 20"
 
-        # SPEED OPTIMIZATION: Get only critical updates first
         Write-Host "Scanning for CRITICAL updates only (for speed)..."
         $criticalUpdates = Get-WindowsUpdate -MicrosoftUpdate -Severity Critical -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue
         
@@ -1799,7 +1704,6 @@ function Run-WindowsUpdates {
             $total = $criticalUpdates.Count
             Write-Host "Found $total critical updates - installing in parallel where possible"
             
-            # Install critical updates with maximum parallelization
             $updateJobs = @()
             $batchSize = 3  # Install 3 updates simultaneously for speed
             
@@ -1813,26 +1717,22 @@ function Run-WindowsUpdates {
                         try {
                             Install-WindowsUpdate -KBArticleID $update.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
                         } catch {
-                            # Continue with other updates
                         }
                     }
                 } -ArgumentList $batch
                 
                 $updateJobs += $updateJob
                 
-                # Update progress
                 $percent = [math]::Round((($i + $batchSize) / $total) * 80) + 20  # 20-100% range
                 Write-Output "winupdate progress: $percent"
             }
             
-            # Wait for all update jobs to complete
             $updateJobs | Wait-Job -Timeout 1800 -ErrorAction SilentlyContinue | Out-Null  # 30 minute timeout
             $updateJobs | Remove-Job -Force -ErrorAction SilentlyContinue
             
         } else {
             Write-Host "No critical updates found, checking for other important updates..."
             
-            # If no critical updates, get important updates with size limit for speed
             $importantUpdates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | 
                 Where-Object { $_.Size -lt 100MB }  # Only install updates smaller than 100MB for speed
             
@@ -1849,7 +1749,6 @@ function Run-WindowsUpdates {
                     try {
                         Install-WindowsUpdate -KBArticleID $update.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
                     } catch {
-                        # Continue with other updates
                     }
                 }
             }
@@ -1870,43 +1769,35 @@ function Restore-SystemSettings {
     Write-Host "=== RESTORING SYSTEM SETTINGS ===" -ForegroundColor Cyan
     
     try {
-        # Restore Windows Defender if we disabled it
         if ($script:DefenderDisabled) {
             try {
                 Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
                 Write-Host "Restored Windows Defender real-time protection" -ForegroundColor Green
             } catch {
-                # Silent failure
             }
         }
         
-        # Restore original power plan
         if ($script:OriginalPowerPlan) {
             try {
                 powercfg /setactive $script:OriginalPowerPlan | Out-Null 2>&1
                 Write-Host "Restored original power plan: $script:OriginalPowerPlan" -ForegroundColor Green
             } catch {
-                # Silent failure
             }
         }
         
-        # Reset process priority to normal
         try {
             $currentProcess = Get-Process -Id $PID
             $currentProcess.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
             Write-Host "Reset process priority to normal"
         } catch {
-            # Silent failure
         }
         
-        # Restart services we stopped
         $servicesToRestart = @("Themes", "TabletInputService")
         foreach ($service in $servicesToRestart) {
             try {
                 Start-Service $service -ErrorAction SilentlyContinue
                 Write-Host "Restarted service: $service"
             } catch {
-                # Service may not exist on all systems
             }
         }
         
@@ -1923,11 +1814,9 @@ function Complete-Deployment {
     Write-Host "`n=== DEPLOYMENT COMPLETION ===" -ForegroundColor Green
     
     try {
-        # Calculate total deployment time
         $totalTime = (Get-Date) - $script:DeploymentStartTime
         Write-Host "Total deployment time: $($totalTime.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
         
-        # Display results summary
         Write-Host "`nDeployment Results:" -ForegroundColor Yellow
         foreach ($key in $Results.Keys) {
             $status = if ($Results[$key]) { "SUCCESS" } else { "FAILED" }
@@ -1935,7 +1824,6 @@ function Complete-Deployment {
             Write-Host "  $key`: $status" -ForegroundColor $color
         }
         
-        # Clean up background jobs
         $jobs = Get-Job -ErrorAction SilentlyContinue
         foreach ($job in $jobs) {
             if ($job.State -in @('Completed', 'Failed', 'Stopped')) {
@@ -1943,7 +1831,6 @@ function Complete-Deployment {
             }
         }
         
-        # Clean up temporary files
         $tempFiles = @(
             "$env:TEMP\AdobeReader_*.log",
             "$env:TEMP\OfficeUninstall.log",
@@ -1958,10 +1845,8 @@ function Complete-Deployment {
         Write-Host "Remote management is now enabled for future maintenance" -ForegroundColor Cyan
         
     } finally {
-        # Restore system settings
         Restore-SystemSettings
         
-        # Stop transcript
         Stop-Transcript -ErrorAction SilentlyContinue
     }
 }
@@ -2018,7 +1903,6 @@ $domainJob = Start-Job -ScriptBlock {
     $computerRenamed = $false
     
     if ($credential) {
-        # Test network connectivity first
         $servers = switch ($location.ToUpper()) {
             "GEORGIA"  { @("GA-DC02") }
             "ARKANSAS" { @("AR-DC", "10.1.199.2") }
@@ -2035,7 +1919,6 @@ $domainJob = Start-Job -ScriptBlock {
         }
         
         if ($networkOk) {
-            # Domain join logic
             try {
                 switch ($location.ToUpper()) {
                     "GEORGIA" {
@@ -2056,7 +1939,6 @@ $domainJob = Start-Job -ScriptBlock {
                 # Domain join failed
             }
             
-            # Computer rename
             if (-not [string]::IsNullOrWhiteSpace($computerName)) {
                 try {
                     if ($domainJoined) {
@@ -2080,7 +1962,6 @@ $domainJob = Start-Job -ScriptBlock {
 
 Write-DeploymentProgress -CurrentStep 4 -TotalSteps 15 -StepDescription "Starting parallel software installations"
 
-# RESTORED: Start ALL software installations in parallel
 Start-ParallelInstallations
 
 Write-DeploymentProgress -CurrentStep 5 -TotalSteps 15 -StepDescription "Adobe Reader installation (with 1624 fix)"
@@ -2113,9 +1994,7 @@ $domainResults = Wait-Job $domainJob -Timeout 60 | Receive-Job -ErrorAction Sile
 Remove-Job $domainJob -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 11 -TotalSteps 15 -StepDescription "Starting optimized Windows Updates (critical updates first)"
-# RESTORED: Start Windows Updates in background while doing final tasks
 $updatesJob = Start-Job -ScriptBlock {
-    # Windows Updates function will run here
     try {
         # Use UsoClient for fastest updates
         Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
@@ -2129,22 +2008,18 @@ $updatesJob = Start-Job -ScriptBlock {
 
 Write-DeploymentProgress -CurrentStep 12 -TotalSteps 15 -StepDescription "Final verification and cleanup"
 
-# RESTORED: Verify installations while updates run in background
 $verificationJob = Verify-Installations
 
-# Wait for Windows Updates to complete
 Write-Host "Waiting for Windows Updates to complete..." -ForegroundColor Yellow
 $updateResult = Wait-Job $updatesJob -Timeout 1800 | Receive-Job -ErrorAction SilentlyContinue # 30 minute timeout
 Remove-Job $updatesJob -Force -ErrorAction SilentlyContinue
 Write-Host $updateResult -ForegroundColor $(if ($updateResult -match "Completed") { "Green" } else { "Yellow" })
 
-# Wait for verification to complete
 $verificationResults = Wait-Job $verificationJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
 Remove-Job $verificationJob -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 13 -TotalSteps 15 -StepDescription "Finalizing deployment"
 
-# Collect final results
 $deploymentResults = @{
     "Domain Join" = $domainResults.DomainJoined
     "Computer Rename" = $domainResults.ComputerRenamed
@@ -2155,7 +2030,6 @@ $deploymentResults = @{
 
 if ($installVPN) { $deploymentResults["VPN"] = $vpnInstalled }
 
-# RESTORED: Cleanup staging directory
 Remove-Item $localStage -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 14 -TotalSteps 15 -StepDescription "Deployment complete"
