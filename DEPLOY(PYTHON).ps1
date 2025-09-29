@@ -6,11 +6,13 @@ param(
     [switch]$installVANTAGE
 )
 
+
 if ($env:PSI_DEPLOYMENT_DIR) {
-    $PSScriptRoot = $env:PSI_DEPLOYMENT_DIR
-    Write-Host "Using deployment directory: $PSScriptRoot"
+    $DeploymentRoot = $env:PSI_DEPLOYMENT_DIR
+    Write-Host "Using deployment directory from environment: $DeploymentRoot"
 } else {
-    Write-Host "WARNING: PSI_DEPLOYMENT_DIR not set, using script directory"
+    $DeploymentRoot = $PSScriptRoot
+    Write-Host "Using script directory: $DeploymentRoot"
 }
 
 $script:DefenderDisabled = $false
@@ -199,7 +201,7 @@ Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Enablin
 Enable-RemoteManagement
 
 function Get-DomainCredential {
-    param([string]$ScriptDirectory = $PSScriptRoot)
+    param([string]$ScriptDirectory = $DeploymentRoot)  
     
     try {
         Write-Host "=== CREDENTIAL LOADING ==="
@@ -574,7 +576,7 @@ function Start-ParallelInstallations {
         } else {
             return "TeamViewer: Installer not found"
         }
-    } -ArgumentList $PSScriptRoot
+    } -ArgumentList $DeploymentRoot
     $jobs += $tvJob
     
     $csJob = Start-Job -Name "CrowdStrike" -ScriptBlock {
@@ -590,7 +592,7 @@ function Start-ParallelInstallations {
         } else {
             return "CrowdStrike: Installer not found"
         }
-    } -ArgumentList $PSScriptRoot
+    } -ArgumentList $DeploymentRoot
     $jobs += $csJob
     
     $dotnetJob = Start-Job -Name "DotNet" -ScriptBlock {
@@ -719,7 +721,7 @@ function Start-BackgroundInstaller {
 
 function Install-CrowdStrike {
     param(
-        [string]$InstallerPath = "$PSScriptRoot\WindowsSensor.MaverickGyr.exe",
+        [string]$InstallerPath = "$DeploymentRoot\WindowsSensor.MaverickGyr.exe",
         [string]$CID = "47AB920FB2F34F00BEDE8311E34EA489-EB"
     )
 
@@ -771,9 +773,9 @@ function Install-Vantage {
         [string]$location
     )
 
-    $batPath       = Join-Path $PSScriptRoot "client803.bat"
+    $batPath = Join-Path $DeploymentRoot "client803.bat" 
     $targetPath    = "C:\client803"
-    $sourceClientFolder = Join-Path $PSScriptRoot "client803_source" 
+    $sourceClientFolder = Join-Path $DeploymentRoot "client803_source" 
     $defaultTotalFiles  = 17023
 
     switch ($location.ToUpper()) {
@@ -983,12 +985,11 @@ function Install-Vantage {
 
     Write-Host "Installing Vantage dependencies..."
     $installSteps = @(
-        @{ Path = "$PSScriptRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0" },
-        @{ Path = "$PSScriptRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95; Name = "Crystal Reports" },
-        @{ Path = "$PSScriptRoot\dotNetFx35Setup.exe"; Percent = 98; Name = ".NET Framework 3.5" },
-        @{ Path = "$PSScriptRoot\sqlncli.msi"; Percent = 99; Name = "SQL Native Client" }
+        @{ Path = "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0" },
+        @{ Path = "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95; Name = "Crystal Reports" },
+        @{ Path = "$DeploymentRoot\dotNetFx35Setup.exe"; Percent = 98; Name = ".NET Framework 3.5" },
+        @{ Path = "$DeploymentRoot\sqlncli.msi"; Percent = 99; Name = "SQL Native Client" }
     )
-
     foreach ($step in $installSteps) {
         if (Test-Path $step.Path) {
             Write-Host "Installing $($step.Name)..."
@@ -1299,10 +1300,10 @@ function Remove-Office365 {
 
 function Install-AdobeReader {
     # ZERO-POPUP Adobe installation with multiple fallback methods AND MSP patch application
-    $msiPath = Join-Path $PSScriptRoot "AcroRead.msi"
-    $mstPath = Join-Path $PSScriptRoot "AcroRead.mst"
-    $mspPath = Join-Path $PSScriptRoot "AcroRdrDCUpd2500120693.msp"
-    $cabPath = Join-Path $PSScriptRoot "Data1.cab"
+    $msiPath = Join-Path $DeploymentRoot "AcroRead.msi"
+    $mstPath = Join-Path $DeploymentRoot "AcroRead.mst"
+    $mspPath = Join-Path $DeploymentRoot "AcroRdrDCUpd2500120693.msp"
+    $cabPath = Join-Path $DeploymentRoot "Data1.cab"
 
     if (-not (Test-Path $msiPath)) { 
         Write-Host "MSI not found: $msiPath" 
@@ -1321,7 +1322,7 @@ function Install-AdobeReader {
         try {
             Write-Host "Attempting installation with integrated patch (Method 1)..."
             $patchArgs = @("/i", "`"$msiPath`"", "PATCH=`"$mspPath`"", "/qn", "/norestart", "ALLUSERS=1", "EULA_ACCEPT=YES", "SUPPRESS_APP_LAUNCH=YES")
-            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -Wait -PassThru -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
+            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -Wait -PassThru -WorkingDirectory $DeploymentRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
             
             if ($process.ExitCode -eq 0) {
                 Write-Host "Adobe Reader installed successfully with patch (Method 1)" -ForegroundColor Green
@@ -1337,7 +1338,7 @@ function Install-AdobeReader {
     try {
         Write-Host "Attempting installation without transform (Method 2)..."
         $simpleArgs = @("/i", "`"$msiPath`"", "/qn", "/norestart", "ALLUSERS=1", "EULA_ACCEPT=YES", "SUPPRESS_APP_LAUNCH=YES")
-        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $simpleArgs -Wait -PassThru -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
+        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $simpleArgs -Wait -PassThru -WorkingDirectory $DeploymentRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
         
         if ($process.ExitCode -eq 0) {
             Write-Host "Adobe Reader base installation successful (Method 2)" -ForegroundColor Green
@@ -1427,7 +1428,7 @@ function Install-AdobeReader {
         Start-Sleep -Seconds 3
         
         $repairArgs = @("/i", "`"$msiPath`"", "/qn", "/norestart", "REINSTALL=ALL", "REINSTALLMODE=vomus")
-        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $repairArgs -Wait -PassThru -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
+        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $repairArgs -Wait -PassThru -WorkingDirectory $DeploymentRoot -WindowStyle Hidden -ErrorAction SilentlyContinue
         
         if ($process.ExitCode -eq 0) {
             Write-Host "Adobe Reader repair installation successful (Method 4)" -ForegroundColor Green
@@ -1454,7 +1455,7 @@ function Install-AdobeReader {
     try {
         Write-Host "Attempting direct executable installation (Method 5)..."
         # Look for EXE version
-        $exePath = Join-Path $PSScriptRoot "AcroRead.exe"
+        $exePath = Join-Path $DeploymentRoot "AcroRead.exe"
         if (Test-Path $exePath) {
             $process = Start-Process -FilePath $exePath -ArgumentList "/sAll", "/rs", "/msi" -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
             if ($process.ExitCode -eq 0) {
@@ -1533,8 +1534,7 @@ function Apply-MSPatch {
     }
 }
 function Install-VPN {
-    $vpnInstaller = Join-Path $PSScriptRoot "silent.bat"
-
+    $vpnInstaller = Join-Path $DeploymentRoot "silent.bat"
     if (-not (Test-Path $vpnInstaller)) {
         Write-Host "VPN installer not found at $vpnInstaller"
         return $false
@@ -1542,7 +1542,7 @@ function Install-VPN {
 
     try {
         Write-Host "Installing Barracuda VPN client..."
-        $process = Start-Process -FilePath $vpnInstaller -WorkingDirectory $PSScriptRoot -Wait -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+        $process = Start-Process -FilePath $vpnInstaller -WorkingDirectory $DeploymentRoot -Wait -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
         Write-Host "Barracuda VPN installation completed."
         return $true
     }
@@ -1553,7 +1553,7 @@ function Install-VPN {
 }
 
 function Install-VPNProfile {
-    $vpnProfile = Join-Path $PSScriptRoot "PSI-PAC VPN.vpn"
+    $vpnProfile = Join-Path $DeploymentRoot "PSI-PAC VPN.vpn"
     if (Test-Path $vpnProfile) {
         try {
             Start-Process -FilePath $vpnProfile -WindowStyle Hidden -ErrorAction SilentlyContinue
@@ -1578,8 +1578,8 @@ function Install-VPNProfile {
 }
 
 function Install-Office365 {
-    $setupPath = Join-Path $PSScriptRoot "setup.exe"
-    $configPath = Join-Path $PSScriptRoot "officesilent.xml"
+    $setupPath = Join-Path $DeploymentRoot "setup.exe"
+    $configPath = Join-Path $DeploymentRoot "officesilent.xml"
     
     if (-not (Test-Path $setupPath)) { 
         Write-Host "Setup file not found: $setupPath"
@@ -1651,7 +1651,7 @@ function Run-WindowsUpdates {
         Write-Host "Starting OPTIMIZED Windows Updates process..." -ForegroundColor Cyan
 
         try {
-            $wuaPath = Join-Path $PSScriptRoot "Windows10Upgrade9252.exe"
+            $wuaPath = Join-Path $DeploymentRoot "Windows10Upgrade9252.exe"
             if (Test-Path $wuaPath) {
                 Write-Host "Using Windows Update Assistant for faster updates..."
                 Start-Process -FilePath $wuaPath -ArgumentList "/quietinstall", "/skipeula", "/auto", "upgrade" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
@@ -1888,7 +1888,7 @@ $credentialJob = Start-Job -ScriptBlock {
         }
     }
     return Get-DomainCredential -ScriptDirectory $scriptDir
-} -ArgumentList $originalPSScriptRoot
+} -ArgumentList $DeploymentRoot  # FIXED: Use $DeploymentRoot
 
 Set-TimeZoneFromUserInput
 
@@ -2030,8 +2030,6 @@ $deploymentResults = @{
 }
 
 if ($installVPN) { $deploymentResults["VPN"] = $vpnInstalled }
-
-Remove-Item $localStage -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 14 -TotalSteps 15 -StepDescription "Deployment complete"
 
