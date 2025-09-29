@@ -341,6 +341,7 @@ function Join-DomainBasedOnLocation {
         }
         "ARKANSAS" {
             try {
+                Resolve-DnsName -Name "AR-DC.psi-pac.com" -Server 10.1.199.2 
                 Write-Host "Configuring DNS for ARKANSAS domain..."
                 Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "10.1.199.2" -ErrorAction Stop | Out-Null
                 Write-Host "Joining ARKANSAS domain (psi-pac.com via AR-DC)..."
