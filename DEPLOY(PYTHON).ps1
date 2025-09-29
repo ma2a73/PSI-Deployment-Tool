@@ -1862,33 +1862,16 @@ Write-Host "=== PSI DEPLOYMENT TOOL - ZERO-POPUP FULL FEATURED VERSION ===" -For
 
 Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Pre-staging installation files"
 
-Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone (parallel)"
+Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone"
 
-$credentialJob = Start-Job -ScriptBlock {
-    param($scriptDir)
-    function Get-DomainCredential {
-        param([string]$ScriptDirectory = $scriptDir)
-        
-        try {
-            $keyPath = Join-Path $ScriptDirectory "key.key"
-            $encryptedPath = Join-Path $ScriptDirectory "encrypted.txt"
-            
-            if (-not (Test-Path $keyPath) -or -not (Test-Path $encryptedPath)) {
-                return $null
-            }
-            
-            $key = Get-Content -Path $keyPath -Encoding Byte -ErrorAction Stop
-            $encrypted = Get-Content -Path $encryptedPath -Raw -ErrorAction Stop
-            $securePassword = $encrypted | ConvertTo-SecureString -Key $key -ErrorAction Stop
-            $credential = New-Object System.Management.Automation.PSCredential("PSI-PAC\Support", $securePassword) -ErrorAction Stop
-            
-            return $credential
-        } catch {
-            return $null
-        }
-    }
-    return Get-DomainCredential -ScriptDirectory $scriptDir
-} -ArgumentList $DeploymentRoot  # FIXED: Use $DeploymentRoot
+Write-Host "Loading domain credentials from: $DeploymentRoot"
+$Credential = Get-DomainCredential -ScriptDirectory $DeploymentRoot
+
+if ($Credential) {
+    Write-Host "Credentials loaded successfully" -ForegroundColor Green
+} else {
+    Write-Host "WARNING: Failed to load credentials - domain operations will be skipped" -ForegroundColor Yellow
+}
 
 Set-TimeZoneFromUserInput
 
