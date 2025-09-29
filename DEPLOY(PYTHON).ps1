@@ -6,6 +6,13 @@ param(
     [switch]$installVANTAGE
 )
 
+if ($env:PSI_DEPLOYMENT_DIR) {
+    $PSScriptRoot = $env:PSI_DEPLOYMENT_DIR
+    Write-Host "Using deployment directory: $PSScriptRoot"
+} else {
+    Write-Host "WARNING: PSI_DEPLOYMENT_DIR not set, using script directory"
+}
+
 $script:DefenderDisabled = $false
 $script:OriginalPowerPlan = $null
 $script:DeploymentStartTime = Get-Date
