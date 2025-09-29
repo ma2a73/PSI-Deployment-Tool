@@ -1861,12 +1861,6 @@ function Complete-Deployment {
 Write-Host "=== PSI DEPLOYMENT TOOL - ZERO-POPUP FULL FEATURED VERSION ===" -ForegroundColor Green
 
 Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Pre-staging installation files"
-$localStage = "C:\DeployStage"
-New-Item -Path $localStage -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-$files = Get-ChildItem $PSScriptRoot -Include "*.exe", "*.msi", "*.mst", "*.msp", "*.cab", "*.bat" -Recurse -ErrorAction SilentlyContinue
-$files | ForEach-Object { Copy-Item $_.FullName $localStage -Force -ErrorAction SilentlyContinue }
-$originalPSScriptRoot = $PSScriptRoot
-$PSScriptRoot = $localStage
 
 Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone (parallel)"
 
