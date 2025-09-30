@@ -15,7 +15,7 @@ if ($env:PSI_DEPLOYMENT_DIR) {
     Write-Host "Using script directory: $DeploymentRoot"
 }
 
-$script:DefenderDisabled = $false
+$script:DefenderDisabled = $false 
 $script:OriginalPowerPlan = $null
 $script:DeploymentStartTime = Get-Date
 
@@ -1299,6 +1299,86 @@ function Remove-Office365 {
     }
 }
 
+function Complete-OfficeRemoval {
+    Write-Host "=== FORCING COMPLETE OFFICE CLEANUP ===" -ForegroundColor Cyan
+    
+    # Kill any lingering Office processes more aggressively
+    $officeProcesses = @("winword", "excel", "powerpnt", "outlook", "onenote", "msaccess", 
+                         "mspub", "lync", "teams", "onenotem", "onenoteim", "officeclicktorun",
+                         "msteams", "skype", "OfficeClickToRun", "integrator", "OSPPSVC")
+    
+    foreach ($proc in $officeProcesses) {
+        Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    
+    # Force stop and disable Office services
+    $services = @("ClickToRunSvc", "OfficeSvc", "OfficeClickToRun", "OSPPSVC")
+    foreach ($svc in $services) {
+        $service = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        if ($service) {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            # Use sc.exe for more aggressive deletion
+            & sc.exe delete $svc 2>&1 | Out-Null
+        }
+    }
+    
+    # Clean up Office registry keys more thoroughly
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Office",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office",
+        "HKCU:\Software\Microsoft\Office",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O365*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\O365*"
+    )
+    
+    foreach ($path in $regPaths) {
+        if ($path -like "*\**") {
+            $parent = Split-Path $path -Parent
+            $filter = Split-Path $path -Leaf
+            if (Test-Path $parent) {
+                Get-ChildItem -Path $parent -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -like $filter } | 
+                    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } elseif (Test-Path $path) {
+            Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    
+    # Force unlock and remove Office files
+    $officePaths = @(
+        "$env:ProgramFiles\Microsoft Office",
+        "${env:ProgramFiles(x86)}\Microsoft Office",
+        "$env:ProgramFiles\Common Files\Microsoft Shared",
+        "${env:ProgramFiles(x86)}\Common Files\Microsoft Shared"
+    )
+    
+    foreach ($path in $officePaths) {
+        if (Test-Path $path) {
+            # Use takeown and icacls to force ownership
+            & takeown.exe /F "$path" /R /D Y 2>&1 | Out-Null
+            & icacls.exe "$path" /grant administrators:F /T 2>&1 | Out-Null
+            Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    
+    # Wait for file system to settle
+    Start-Sleep -Seconds 5
+    
+    # Verify Office is gone
+    $officeCheck = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                   Where-Object { $_.DisplayName -like "*Microsoft*365*" -or $_.DisplayName -like "*Office*" }
+    
+    if ($officeCheck) {
+        Write-Host "WARNING: Office remnants still detected" -ForegroundColor Yellow
+        return $false
+    }
+    
+    Write-Host "Office cleanup completed successfully" -ForegroundColor Green
+    return $true
+}
+
 function Install-AdobeReader {
     # ZERO-POPUP Adobe installation with multiple fallback methods AND MSP patch application
     $msiPath = Join-Path $DeploymentRoot "AcroRead.msi"
@@ -1646,129 +1726,81 @@ function Verify-Installations {
     return $verificationJob
 }
 
-function Run-WindowsUpdates {
+function Install-WindowsUpdatesFast {
+    Write-Host "Starting FAST Windows Updates process..." -ForegroundColor Cyan
+    Write-Output "winupdate progress: 0"
+    
+    # Step 1: Trigger background detection immediately
+    Start-Process -FilePath "wuauclt.exe" -ArgumentList "/detectnow" -WindowStyle Hidden -ErrorAction SilentlyContinue
+    Write-Output "winupdate progress: 5"
+    
+    # Step 2: Use COM objects for actual installation
     try {
-        Write-Output "winupdate progress: 0"
-        Write-Host "Starting OPTIMIZED Windows Updates process..." -ForegroundColor Cyan
-
-        try {
-            $wuaPath = Join-Path $DeploymentRoot "Windows10Upgrade9252.exe"
-            if (Test-Path $wuaPath) {
-                Write-Host "Using Windows Update Assistant for faster updates..."
-                Start-Process -FilePath $wuaPath -ArgumentList "/quietinstall", "/skipeula", "/auto", "upgrade" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-                Write-Output "winupdate progress: 50"
-            }
-        } catch {
-            Write-Host "Windows Update Assistant not available, using alternative method"
-        }
-
-        try {
-            Write-Host "Triggering Windows Update scan using UsoClient (fastest method)..."
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Write-Output "winupdate progress: 30"
-            
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartDownload" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue  
-            Write-Output "winupdate progress: 60"
-            
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartInstall" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Write-Output "winupdate progress: 90"
-            
-            Write-Host "Windows Updates initiated via UsoClient - will continue in background"
+        $updateSession = New-Object -ComObject Microsoft.Update.Session
+        $updateSession.ClientApplicationID = "PSI Deployment Script"
+        $updateSearcher = $updateSession.CreateUpdateSearcher()
+        $updateSearcher.Online = $true
+        
+        Write-Host "Searching for critical and security updates only..."
+        # Only install critical/security to save time
+        $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0 and (CategoryIDs contains '0FA1201D-4330-4FA8-8AE9-B877473B6441' or CategoryIDs contains 'E6CF1350-C01B-414D-A61F-263D14D133B4')")
+        
+        Write-Output "winupdate progress: 15"
+        
+        if ($searchResult.Updates.Count -eq 0) {
+            Write-Host "No critical updates needed"
             Write-Output "winupdate progress: 100"
             return $true
-        } catch {
-            Write-Host "UsoClient method failed, falling back to PSWindowsUpdate"
         }
-
-        Write-Host "Using optimized PSWindowsUpdate module..."
         
-        $moduleJob = Start-Job -ScriptBlock {
-            try {
-                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                
-                Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -MinimumVersion 2.8.5.201 -ErrorAction SilentlyContinue | Out-Null
-                Install-Module -Name PSWindowsUpdate -SkipPublisherCheck -Force -Scope CurrentUser -AllowClobber -ErrorAction SilentlyContinue | Out-Null
-                return $true
-            } catch {
-                return $false
+        Write-Host "Found $($searchResult.Updates.Count) critical/security updates"
+        
+        # Download in parallel if possible
+        $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($update in $searchResult.Updates) {
+            $updatesToDownload.Add($update) | Out-Null
+        }
+        
+        $downloader = $updateSession.CreateUpdateDownloader()
+        $downloader.Updates = $updatesToDownload
+        $downloader.Priority = 3  # Highest priority
+        
+        Write-Host "Downloading updates at high priority..."
+        $downloadResult = $downloader.Download()
+        Write-Output "winupdate progress: 60"
+        
+        # Install immediately after download
+        $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($update in $searchResult.Updates) {
+            if ($update.IsDownloaded) {
+                $updatesToInstall.Add($update) | Out-Null
             }
         }
         
-        $moduleInstalled = Wait-Job $moduleJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
-        Remove-Job $moduleJob -Force -ErrorAction SilentlyContinue
+        Write-Host "Installing $($updatesToInstall.Count) updates..."
+        $installer = $updateSession.CreateUpdateInstaller()
+        $installer.Updates = $updatesToInstall
+        $installer.AllowSourcePrompts = $false
+        $installer.ForceQuiet = $true
         
-        if (-not $moduleInstalled) {
-            Write-Output "winupdate error: Failed to install required modules"
-            return $false
-        }
-
-        Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
-        Write-Output "winupdate progress: 20"
-
-        Write-Host "Scanning for CRITICAL updates only (for speed)..."
-        $criticalUpdates = Get-WindowsUpdate -MicrosoftUpdate -Severity Critical -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue
+        $installResult = $installer.Install()
+        Write-Output "winupdate progress: 95"
         
-        if ($criticalUpdates) {
-            $total = $criticalUpdates.Count
-            Write-Host "Found $total critical updates - installing in parallel where possible"
-            
-            $updateJobs = @()
-            $batchSize = 3  # Install 3 updates simultaneously for speed
-            
-            for ($i = 0; $i -lt $criticalUpdates.Count; $i += $batchSize) {
-                $batch = $criticalUpdates[$i..([Math]::Min($i + $batchSize - 1, $criticalUpdates.Count - 1))]
-                
-                $updateJob = Start-Job -ScriptBlock {
-                    param($updates)
-                    Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
-                    foreach ($update in $updates) {
-                        try {
-                            Install-WindowsUpdate -KBArticleID $update.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-                        } catch {
-                        }
-                    }
-                } -ArgumentList $batch
-                
-                $updateJobs += $updateJob
-                
-                $percent = [math]::Round((($i + $batchSize) / $total) * 80) + 20  # 20-100% range
-                Write-Output "winupdate progress: $percent"
-            }
-            
-            $updateJobs | Wait-Job -Timeout 1800 -ErrorAction SilentlyContinue | Out-Null  # 30 minute timeout
-            $updateJobs | Remove-Job -Force -ErrorAction SilentlyContinue
-            
-        } else {
-            Write-Host "No critical updates found, checking for other important updates..."
-            
-            $importantUpdates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | 
-                Where-Object { $_.Size -lt 100MB }  # Only install updates smaller than 100MB for speed
-            
-            if ($importantUpdates) {
-                $total = $importantUpdates.Count
-                Write-Host "Installing $total important updates (size-limited for speed)..."
-                
-                $count = 0
-                foreach ($update in $importantUpdates) {
-                    $count++
-                    $percent = 20 + [math]::Round(($count / $total) * 80)
-                    Write-Output "winupdate progress: $percent"
-                    
-                    try {
-                        Install-WindowsUpdate -KBArticleID $update.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-                    } catch {
-                    }
-                }
-            }
+        # Count successes
+        $successCount = 0
+        for ($i = 0; $i -lt $updatesToInstall.Count; $i++) {
+            $resultCode = $installResult.GetUpdateResult($i).ResultCode
+            if ($resultCode -eq 2) { $successCount++ }
         }
         
+        Write-Host "Successfully installed $successCount critical updates"
         Write-Output "winupdate progress: 100"
-        Write-Host "Windows Updates completed (critical and important only for speed)" -ForegroundColor Green
+        
         return $true
         
     } catch {
+        Write-Host "Update installation failed: $($_.Exception.Message)" -ForegroundColor Red
         Write-Output "winupdate error: $($_.Exception.Message)"
-        Write-Host "Windows Updates encountered an error but deployment will continue" -ForegroundColor Yellow
         return $false
     }
 }
@@ -1955,6 +1987,19 @@ $adobeInstalled = Install-AdobeReader
 Write-DeploymentProgress -CurrentStep 6 -TotalSteps 15 -StepDescription "Office 365 removal (zero-popup automation)"
 Remove-Office365
 
+Write-Host "Performing aggressive Office cleanup..." -ForegroundColor Yellow
+$cleanupSuccess = Complete-OfficeRemoval
+
+Start-Sleep -Seconds 10
+
+Write-DeploymentProgress -CurrentStep 7 -TotalSteps 15 -StepDescription "Office 365 installation"
+if ($cleanupSuccess) {
+    $officeInstalled = Install-Office365
+} else {
+    Write-Host "Office cleanup incomplete - installation may fail. Consider manual reboot." -ForegroundColor Yellow
+    $officeInstalled = Install-Office365
+}
+
 Write-DeploymentProgress -CurrentStep 7 -TotalSteps 15 -StepDescription "Office 365 installation"
 $officeInstalled = Install-Office365
 
@@ -1980,16 +2025,9 @@ Remove-Job $domainJob -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 11 -TotalSteps 15 -StepDescription "Starting optimized Windows Updates (critical updates first)"
 $updatesJob = Start-Job -ScriptBlock {
-    try {
-        # Use UsoClient for fastest updates
-        Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-        Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartDownload" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-        Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartInstall" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-        return "Windows Updates: Completed successfully"
-    } catch {
-        return "Windows Updates: $($_.Exception.Message)"
-    }
-}
+       ${function:Install-WindowsUpdatesFast} = ${function:Install-WindowsUpdatesFast}
+       Install-WindowsUpdatesFast
+   }
 
 Write-DeploymentProgress -CurrentStep 12 -TotalSteps 15 -StepDescription "Final verification and cleanup"
 
