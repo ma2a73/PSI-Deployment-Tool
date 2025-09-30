@@ -6,6 +6,7 @@ param(
     [switch]$installVANTAGE
 )
 
+
 if ($env:PSI_DEPLOYMENT_DIR) {
     $DeploymentRoot = $env:PSI_DEPLOYMENT_DIR
     Write-Host "Using deployment directory from environment: $DeploymentRoot"
@@ -44,7 +45,7 @@ function Optimize-DeploymentPerformance {
         
         try {
             $script:OriginalPowerPlan = (powercfg /getactivescheme) -replace '.*GUID: ([a-f0-9\-]+).*', '$1'
-            $highPerf = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+            $highPerf = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"  # High Performance GUID
             powercfg /setactive $highPerf | Out-Null 2>&1
             Write-Host "Activated HIGH PERFORMANCE power plan (original: $script:OriginalPowerPlan)"
         } catch {
@@ -307,6 +308,77 @@ function Test-NetworkConnectivity {
     return $true
 }
 
+function Join-DomainBasedOnLocation {
+    param([string]$Location, [object]$Credential)
+    
+    Write-Host "=== DOMAIN JOIN PROCESS ==="
+    
+    if (-not $Credential) {
+        Write-Host "Domain join skipped: No valid credentials available"
+        Write-Host "Manual domain join required after deployment"
+        return $false
+    }
+    
+    if (-not (Test-NetworkConnectivity -Location $Location)) {
+        Write-Host "Network connectivity issues detected - domain join may fail" -ForegroundColor Yellow
+    }
+    
+    Write-Host "Domain join credentials validated successfully"
+    Write-Host "Attempting to join domain for location: $Location"
+    
+    $joined = $false
+    switch ($Location.ToUpper()) {
+        "GEORGIA" {
+            try {
+                Write-Host "Joining GEORGIA domain (psi-pac.com via GA-DC02)..."
+                Add-Computer -DomainName "psi-pac.com" -Server "GA-DC02" -Credential $Credential -Force -ErrorAction Stop | Out-Null
+                $joined = $true
+                Write-Host "Successfully joined GEORGIA domain"
+            } catch {
+                Write-Host "Failed to join GEORGIA domain: $($_.Exception.Message)"
+                Write-Host "Error details: $($_.Exception.GetType().FullName)"
+            }
+        }
+        "ARKANSAS" {
+            try {
+                Resolve-DnsName -Name "AR-DC.psi-pac.com" -Server 10.1.199.2 
+                Write-Host "Configuring DNS for ARKANSAS domain..."
+                Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "10.1.199.2" -ErrorAction Stop | Out-Null
+                Write-Host "Joining ARKANSAS domain (psi-pac.com via AR-DC)..."
+                Add-Computer -DomainName "psi-pac.com" -Server "AR-DC" -Credential $Credential -Force -ErrorAction Stop
+                $joined = $true
+                Write-Host "Successfully joined ARKANSAS domain"
+            } catch {
+                Write-Host "Failed to join ARKANSAS domain: $($_.Exception.Message)"
+                Write-Host "Error details: $($_.Exception.GetType().FullName)"
+            }
+        }
+        "IDAHO" {
+            try {
+                Write-Host "Joining IDAHO domain (psi-pac.com via ID-DC)..."
+                Add-Computer -DomainName "psi-pac.com" -Server "ID-DC" -Credential $Credential -Force -ErrorAction Stop | Out-Null
+                $joined = $true
+                Write-Host "Successfully joined IDAHO domain"
+            } catch {
+                Write-Host "Failed to join IDAHO domain: $($_.Exception.Message)"
+                Write-Host "Error details: $($_.Exception.GetType().FullName)"
+            }
+        }
+        Default {
+            Write-Host "Invalid location provided: $Location"
+            Write-Host "Valid locations: GEORGIA, ARKANSAS, IDAHO"
+        }
+    }
+    
+    if ($joined) {
+        Write-Host "Domain join completed successfully for $Location"
+    } else {
+        Write-Host "Domain join failed for $Location - manual intervention required"
+    }
+    
+    return $joined
+}
+
 function Rename-ComputerPrompt {
     param([string]$ComputerName, [object]$Credential)
     
@@ -375,7 +447,6 @@ function Run-Installer {
             FilePath = $Path
             PassThru = $true
             WindowStyle = 'Hidden'
-            Wait = $true
             ErrorAction = 'SilentlyContinue'
         }
         
@@ -383,14 +454,42 @@ function Run-Installer {
             $processArgs.ArgumentList = $safeArgs
         }
         
+        # START PROCESS WITHOUT -Wait
         $process = Start-Process @processArgs
+        
+        # MANUALLY WAIT WITH TIMEOUT
+        $timeout = $TimeoutSeconds
+        $elapsed = 0
+        $checkInterval = 2
+        
+        while (-not $process.HasExited -and $elapsed -lt $timeout) {
+            Start-Sleep -Seconds $checkInterval
+            $elapsed += $checkInterval
+            
+            # Progress indicator every 10 seconds
+            if ($elapsed % 10 -eq 0) {
+                Write-Host "  ... installer running ($elapsed seconds elapsed)"
+            }
+        }
+        
+        # If timeout exceeded, kill the process
+        if (-not $process.HasExited) {
+            Write-Host "Installer exceeded timeout ($timeout seconds), terminating process" -ForegroundColor Yellow
+            try {
+                $process.Kill()
+                Start-Sleep -Seconds 2
+            } catch {
+                Write-Host "Failed to kill process: $($_.Exception.Message)" -ForegroundColor Red
+            }
+            return $false
+        }
 
-        if ($process.ExitCode -eq 0) {
-            Write-Host "Installer completed successfully: $Path" -ForegroundColor Green
+        if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {
+            Write-Host "Installer completed successfully: $Path (exit code: $($process.ExitCode))" -ForegroundColor Green
             return $true
         } else {
             Write-Host "Installer completed with exit code $($process.ExitCode): $Path" -ForegroundColor Yellow
-            return $true 
+            return $true  # Still return true for non-critical exit codes
         }
     } catch {
         Write-Host "Installer failed: $Path - $($_.Exception.Message)" -ForegroundColor Red
@@ -449,6 +548,42 @@ function Switch-Logs {
         }
     } catch {
         Write-Host "Failed to switch to remote logging: $($_.Exception.Message)"
+    }
+}
+
+function Enable-SystemFeatures {
+    try {
+        Write-Host "Enabling Windows features..."
+        
+        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null       
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+        
+        Write-Host "System features enabled successfully"
+        return $true
+        
+    } catch {
+        Write-Host "Failed to enable system features: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Enable-DotNetFramework {
+    try {
+        Write-Host "Enabling .NET Framework 3.5 (includes 2.0 and 3.0)..."
+        
+        $sxsSource = "X:\sources\sxs"
+        if (Test-Path $sxsSource) {
+            Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -LimitAccess -Source $sxsSource -ErrorAction SilentlyContinue | Out-Null
+        }
+
+        Start-Process -FilePath "DISM.exe" -ArgumentList "/Online", "/Enable-Feature", "/FeatureName:NetFx3", "/All", "/NoRestart", "/Quiet" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
+        Write-Host ".NET Framework installation initiated silently."
+        return $true
+    } catch {
+        Write-Host "Failed to enable .NET Framework: $_"
+        return $false
     }
 }
 
@@ -514,7 +649,7 @@ function Start-ParallelInstallations {
     
     Write-Host "Started $($jobs.Count) parallel installation jobs" -ForegroundColor Green
     
-    $timeout = 300
+    $timeout = 300  # 5 minutes
     $startTime = Get-Date
     
     while ($jobs.Count -gt 0 -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
@@ -540,6 +675,129 @@ function Start-ParallelInstallations {
     Write-Host "Parallel installations completed" -ForegroundColor Green
 }
 
+function Start-BackgroundInstaller {
+    param(
+        [Parameter(Mandatory=$true)] [string]$Path,
+        [string[]]$Arguments = @(),
+        [int]$WaitSeconds = 30,
+        [string]$FriendlyName = $(Split-Path $Path -Leaf)
+    )
+
+    if (-not (Test-Path $Path)) {
+        Write-Host "$FriendlyName installer not found: $Path"
+        return $null
+    }
+
+    Write-Host "Starting $FriendlyName in background (will wait up to $WaitSeconds seconds for completion)..."
+
+    if ($null -eq $Arguments) { $Arguments = @() }
+    $safeArgs = @()
+    foreach ($a in $Arguments) {
+        if ($a -ne $null -and $a -ne "") { $safeArgs += $a }
+    }
+
+    $job = Start-Job -Name ("InstallJob_" + [System.Guid]::NewGuid().ToString()) -ScriptBlock {
+        param($p, $a, $friendly)
+        try {
+            if ($null -eq $a) { $a = @() }
+            $innerArgs = @()
+            foreach ($x in $a) { if ($x -ne $null -and $x -ne "") { $innerArgs += $x } }
+
+            $processArgs = @{
+                FilePath = $p
+                PassThru = $true
+                WindowStyle = 'Hidden'
+                Wait = $true
+                ErrorAction = 'SilentlyContinue'
+            }
+            
+            if ($innerArgs.Count -gt 0) {
+                $processArgs.ArgumentList = $innerArgs
+            }
+            
+            $proc = Start-Process @processArgs
+
+            if ($proc) {
+                Write-Output "${friendly}: process finished with exit code $($proc.ExitCode)"
+                return $proc.ExitCode -eq 0
+            } else {
+                Write-Output "${friendly}: Start-Process returned no process object"
+                return $false
+            }
+        } catch {
+            Write-Output "${friendly}: installer job error: $_"
+            return $false
+        }
+    } -ArgumentList $Path, $safeArgs, $FriendlyName
+
+    $completed = $false
+    if ($WaitSeconds -gt 0) {
+        $completed = Wait-Job -Job $job -Timeout $WaitSeconds
+    } else {
+        $completed = $false
+    }
+
+    if ($completed) {
+        $output = Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue
+        Write-Host "$FriendlyName background job completed within timeout."
+        if ($output) { $output | ForEach-Object { Write-Host $_ } }
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        return $true
+    } else {
+        Write-Host "$FriendlyName still running in background (did not finish within $WaitSeconds seconds). Continuing with the rest of the script."
+        return $job  # Return job for later cleanup
+    }
+}
+
+function Install-CrowdStrike {
+    param(
+        [string]$InstallerPath = "$DeploymentRoot\WindowsSensor.MaverickGyr.exe",
+        [string]$CID = "47AB920FB2F34F00BEDE8311E34EA489-EB"
+    )
+
+    Write-Host "Checking if CrowdStrike is already installed..."
+
+    $service = Get-Service -Name "CSFalconService" -ErrorAction SilentlyContinue
+    if ($service) {
+        Write-Host "CrowdStrike is already installed (Service: $($service.Status))"
+        return $true
+    }
+
+    $csRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CSFalconService"
+    if (Test-Path $csRegPath) {
+        $imagePath = (Get-ItemProperty -Path $csRegPath -ErrorAction SilentlyContinue).ImagePath
+        Write-Host "CrowdStrike is already installed (Registry entry found: $imagePath)"
+        return $true
+    }
+
+    if (-not (Test-Path $InstallerPath)) {
+        Write-Host "CrowdStrike installer not found: $InstallerPath"
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($CID)) {
+        Write-Host "CID not provided. Silent install requires CID."
+        return $false
+    }
+
+    $args = "/install","/quiet","/norestart","CID=$CID"
+    try {
+        Write-Host "Launching CrowdStrike installer..."
+        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $args -PassThru -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+        if ($proc -and ($proc.ExitCode -eq 0)) {
+            Write-Host "CrowdStrike installed successfully (ExitCode $($proc.ExitCode))"
+            return $true
+        } else {
+            $exit = if ($proc) { $proc.ExitCode } else { "unknown" }
+            Write-Host "CrowdStrike installer finished with exit code $exit"
+            return $true  # Often succeeds even with non-zero exit code
+        }
+    } catch {
+        Write-Host "CrowdStrike installation failed: $_"
+        return $false
+    }
+}
+
 function Install-Vantage {
     param (
         [string]$location
@@ -548,37 +806,11 @@ function Install-Vantage {
     $targetPath = "C:\client803"
     $defaultTotalFiles = 17023
 
-    switch ($location.ToUpper()) {
-        "GEORGIA" { 
-            $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
-            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
-            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
-            $fallbackFolder = "\\ga-dc02\Shared2\Vantage\client803"
-        }
-        "ARKANSAS" { 
-            $remoteZip      = "\\ar-dc\Shared\Vantage\client803.zip"
-            $remoteFolder   = "\\ar-dc\Shared\Vantage\client803"
-            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
-            $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
-        }
-        "IDAHO" { 
-            $remoteZip      = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803.zip"
-            $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803"
-            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
-            $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
-        }
-        default { 
-            $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
-            $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
-            $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
-            $fallbackFolder = $null
-        }
-    }
-
     Write-Host "=== VANTAGE INSTALLATION PROCESS ===" -ForegroundColor Cyan
     Write-Host "Target location: $location"
     Write-Output "vantage progress: 0"
 
+    # Check if already installed
     if (Test-Path $targetPath) {
         Write-Host "Target directory already exists: $targetPath"
         $existingFiles = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
@@ -590,73 +822,129 @@ function Install-Vantage {
         }
     }
 
+    # First check deployment cache (downloaded via Python from IIS)
+    $localZip = Join-Path $DeploymentRoot "client803.zip"
+    $useLocalCache = $false
+    
+    if (Test-Path $localZip) {
+        Write-Host "Found client803.zip in deployment cache: $localZip" -ForegroundColor Green
+        $remoteZip = $localZip
+        $useLocalCache = $true
+    } else {
+        Write-Host "client803.zip not found in cache, using network paths" -ForegroundColor Yellow
+        
+        # Fallback to network paths
+        switch ($location.ToUpper()) {
+            "GEORGIA" { 
+                $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
+                $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+                $fallbackFolder = "\\ga-dc02\Shared2\Vantage\client803"
+            }
+            "ARKANSAS" { 
+                $remoteZip      = "\\ar-dc\Shared\Vantage\client803.zip"
+                $remoteFolder   = "\\ar-dc\Shared\Vantage\client803"
+                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+                $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+            }
+            "IDAHO" { 
+                $remoteZip      = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803.zip"
+                $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803"
+                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+                $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+            }
+            default { 
+                $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
+                $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
+                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
+                $fallbackFolder = $null
+            }
+        }
+    }
+
     $zipSuccess = $false
     
+    # Try ZIP extraction method
     if (Test-Path $remoteZip -ErrorAction SilentlyContinue) {
         Write-Host "Found ZIP archive: $remoteZip" -ForegroundColor Green
         Write-Host "Using compressed archive method (10-20x faster)..." -ForegroundColor Cyan
         
         try {
-            $tempZip = "$env:TEMP\client803_install.zip"
-            
-            Write-Host "Copying compressed archive..."
-            Write-Output "vantage progress: 5"
-            
-            $copyJob = Start-Job -ScriptBlock {
-                param($source, $dest)
-                try {
-                    Copy-Item -Path $source -Destination $dest -Force -ErrorAction Stop
-                    return @{Success=$true; Size=(Get-Item $dest).Length}
-                } catch {
-                    return @{Success=$false; Error=$_.Exception.Message}
-                }
-            } -ArgumentList $remoteZip, $tempZip
-            
-            $startTime = Get-Date
-            $timeout = 600
-            $lastProgress = 5
-            
-            while ($copyJob.State -eq 'Running' -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
-                $elapsed = ((Get-Date) - $startTime).TotalSeconds
-                $progress = 5 + [math]::Min([math]::Round(($elapsed / $timeout) * 45), 45)
+            if ($useLocalCache) {
+                # Already in cache, use directly
+                $tempZip = $localZip
+                Write-Host "Using cached archive directly" -ForegroundColor Green
+                Write-Output "vantage progress: 50"
+            } else {
+                # Copy from network
+                $tempZip = "$env:TEMP\client803_install.zip"
                 
-                if ($progress -gt $lastProgress) {
-                    Write-Output "vantage progress: $progress"
-                    $lastProgress = $progress
+                Write-Host "Copying compressed archive from network..."
+                Write-Output "vantage progress: 5"
+                
+                $copyJob = Start-Job -ScriptBlock {
+                    param($source, $dest)
+                    try {
+                        Copy-Item -Path $source -Destination $dest -Force -ErrorAction Stop
+                        return @{Success=$true; Size=(Get-Item $dest).Length}
+                    } catch {
+                        return @{Success=$false; Error=$_.Exception.Message}
+                    }
+                } -ArgumentList $remoteZip, $tempZip
+                
+                $startTime = Get-Date
+                $timeout = 600
+                $lastProgress = 5
+                
+                while ($copyJob.State -eq 'Running' -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
+                    $elapsed = ((Get-Date) - $startTime).TotalSeconds
+                    $progress = 5 + [math]::Min([math]::Round(($elapsed / $timeout) * 45), 45)
+                    
+                    if ($progress -gt $lastProgress) {
+                        Write-Output "vantage progress: $progress"
+                        $lastProgress = $progress
+                    }
+                    Start-Sleep -Seconds 3
                 }
-                Start-Sleep -Seconds 3
-            }
-            
-            $copyResult = Wait-Job $copyJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
-            Remove-Job $copyJob -Force -ErrorAction SilentlyContinue
-            
-            if ($copyResult.Success) {
+                
+                $copyResult = Wait-Job $copyJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
+                Remove-Job $copyJob -Force -ErrorAction SilentlyContinue
+                
+                if (-not $copyResult.Success) {
+                    throw "Copy failed: $($copyResult.Error)"
+                }
+                
                 Write-Output "vantage progress: 50"
                 $zipSize = [math]::Round($copyResult.Size / 1MB, 2)
                 Write-Host "Archive copied successfully ($zipSize MB)" -ForegroundColor Green
-                Write-Host "Extracting archive to $targetPath..."
+            }
+            
+            Write-Host "Extracting archive to $targetPath..."
+            
+            try {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $targetPath)
                 
-                try {
-                    Add-Type -AssemblyName System.IO.Compression.FileSystem
-                    [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $targetPath)
-                    
+                # Clean up temp file if we copied from network
+                if (-not $useLocalCache) {
                     Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
-                    Write-Output "vantage progress: 85"
-                    
-                    $finalCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
-                    Write-Host "Archive extraction completed: $finalCount files extracted" -ForegroundColor Green
-                    
-                    $zipSuccess = $true
-                    
-                } catch {
-                    Write-Host "Extraction failed: $($_.Exception.Message)" -ForegroundColor Red
-                    Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
-                    if (Test-Path $targetPath) {
-                        Remove-Item $targetPath -Recurse -Force -ErrorAction SilentlyContinue
-                    }
                 }
-            } else {
-                Write-Host "ZIP copy failed: $($copyResult.Error)" -ForegroundColor Yellow
+                
+                Write-Output "vantage progress: 85"
+                
+                $finalCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
+                Write-Host "Archive extraction completed: $finalCount files extracted" -ForegroundColor Green
+                
+                $zipSuccess = $true
+                
+            } catch {
+                Write-Host "Extraction failed: $($_.Exception.Message)" -ForegroundColor Red
+                if (-not $useLocalCache) {
+                    Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
+                }
+                if (Test-Path $targetPath) {
+                    Remove-Item $targetPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
             }
             
         } catch {
@@ -667,6 +955,7 @@ function Install-Vantage {
         Write-Host "Falling back to folder copy method..."
     }
 
+    # Fallback to robocopy if ZIP method failed
     if (-not $zipSuccess) {
         Write-Host "Using ultra-optimized robocopy method..." -ForegroundColor Yellow
         
@@ -747,6 +1036,7 @@ function Install-Vantage {
         }
     }
     
+    # Verify installation
     if (Test-Path $targetPath) {
         $finalCount = (Get-ChildItem -Path $targetPath -Recurse -File -ErrorAction SilentlyContinue).Count
         Write-Host "Copy verification: $finalCount files copied" -ForegroundColor Green
@@ -755,15 +1045,17 @@ function Install-Vantage {
         }
     }
 
+    # Enable SMB1 for legacy Vantage compatibility
     Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
     Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
     
+    # Install Vantage dependencies
     Write-Host "Installing Vantage dependencies..." -ForegroundColor Cyan
     $installSteps = @(
-        @{ Path = "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0" },
-        @{ Path = "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95; Name = "Crystal Reports" },
-        @{ Path = "$DeploymentRoot\dotNetFx35Setup.exe"; Percent = 98; Name = ".NET Framework 3.5" },
-        @{ Path = "$DeploymentRoot\sqlncli.msi"; Percent = 99; Name = "SQL Native Client" }
+        @{ Path = "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0"; Timeout = 120 },
+        @{ Path = "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95; Name = "Crystal Reports"; Timeout = 180 },
+        @{ Path = "$DeploymentRoot\dotNetFx35Setup.exe"; Percent = 98; Name = ".NET Framework 3.5"; Timeout = 300 },
+        @{ Path = "$DeploymentRoot\sqlncli.msi"; Percent = 99; Name = "SQL Native Client"; Timeout = 120 }
     )
     
     foreach ($step in $installSteps) {
@@ -775,13 +1067,20 @@ function Install-Vantage {
                 ".exe" { @("/quiet", "/norestart") } 
                 default { @("/quiet", "/norestart") } 
             }
-            Start-Process -FilePath $step.Path -ArgumentList $args -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+            
+            $success = Run-Installer -Path $step.Path -Arguments $args -TimeoutSeconds $step.Timeout
+            
+            if (-not $success) {
+                Write-Host "Warning: $($step.Name) installation may have issues, continuing..." -ForegroundColor Yellow
+            }
+            
             Write-Output "vantage progress: $($step.Percent)"
         } else {
             Write-Host "Dependency not found: $($step.Name) at $($step.Path)" -ForegroundColor Yellow
         }
     }
 
+    # Copy desktop shortcut
     $desktopPath = "$env:PUBLIC\Desktop"
     if (Test-Path $remoteShortcut) { 
         Copy-Item -Path $remoteShortcut -Destination $desktopPath -Force -ErrorAction SilentlyContinue
@@ -926,6 +1225,7 @@ function Remove-Office365 {
                     Write-Host "ClickToRun removal completed silently." -ForegroundColor Green
                     
                 } catch {
+                    # Silent failure
                 }
             }
         }
@@ -1076,6 +1376,7 @@ function Remove-Office365 {
 function Complete-OfficeRemoval {
     Write-Host "=== FORCING COMPLETE OFFICE CLEANUP ===" -ForegroundColor Cyan
     
+    # Kill any lingering Office processes more aggressively
     $officeProcesses = @("winword", "excel", "powerpnt", "outlook", "onenote", "msaccess", 
                          "mspub", "lync", "teams", "onenotem", "onenoteim", "officeclicktorun",
                          "msteams", "skype", "OfficeClickToRun", "integrator", "OSPPSVC")
@@ -1084,16 +1385,19 @@ function Complete-OfficeRemoval {
         Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     }
     
+    # Force stop and disable Office services
     $services = @("ClickToRunSvc", "OfficeSvc", "OfficeClickToRun", "OSPPSVC")
     foreach ($svc in $services) {
         $service = Get-Service -Name $svc -ErrorAction SilentlyContinue
         if ($service) {
             Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            # Use sc.exe for more aggressive deletion
             & sc.exe delete $svc 2>&1 | Out-Null
         }
     }
     
+    # Clean up Office registry keys more thoroughly
     $regPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Office",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office",
@@ -1116,6 +1420,7 @@ function Complete-OfficeRemoval {
         }
     }
     
+    # Force unlock and remove Office files
     $officePaths = @(
         "$env:ProgramFiles\Microsoft Office",
         "${env:ProgramFiles(x86)}\Microsoft Office",
@@ -1125,14 +1430,17 @@ function Complete-OfficeRemoval {
     
     foreach ($path in $officePaths) {
         if (Test-Path $path) {
+            # Use takeown and icacls to force ownership
             & takeown.exe /F "$path" /R /D Y 2>&1 | Out-Null
             & icacls.exe "$path" /grant administrators:F /T 2>&1 | Out-Null
             Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
     
+    # Wait for file system to settle
     Start-Sleep -Seconds 5
     
+    # Verify Office is gone
     $officeCheck = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
                    Where-Object { $_.DisplayName -like "*Microsoft*365*" -or $_.DisplayName -like "*Office*" }
     
@@ -1146,6 +1454,7 @@ function Complete-OfficeRemoval {
 }
 
 function Install-AdobeReader {
+    # ZERO-POPUP Adobe installation with multiple fallback methods AND MSP patch application
     $msiPath = Join-Path $DeploymentRoot "AcroRead.msi"
     $mstPath = Join-Path $DeploymentRoot "AcroRead.mst"
     $mspPath = Join-Path $DeploymentRoot "AcroRdrDCUpd2500120693.msp"
@@ -1163,6 +1472,7 @@ function Install-AdobeReader {
     
     Write-Host "Starting Adobe Reader installation with error 1624 fixes and patch application..."
 
+    # Method 1: Try installation with patch included (if available) - COMPLETELY SILENT
     if ($hasPatch) {
         try {
             Write-Host "Attempting installation with integrated patch (Method 1)..."
@@ -1179,6 +1489,7 @@ function Install-AdobeReader {
         }
     }
 
+    # Method 2: Try without transform first (fixes many 1624 errors) - COMPLETELY SILENT
     try {
         Write-Host "Attempting installation without transform (Method 2)..."
         $simpleArgs = @("/i", "`"$msiPath`"", "/qn", "/norestart", "ALLUSERS=1", "EULA_ACCEPT=YES", "SUPPRESS_APP_LAUNCH=YES")
@@ -1187,6 +1498,7 @@ function Install-AdobeReader {
         if ($process.ExitCode -eq 0) {
             Write-Host "Adobe Reader base installation successful (Method 2)" -ForegroundColor Green
             
+            # Apply patch after installation if available
             if ($hasPatch) {
                 Write-Host "Applying MSP patch..."
                 if (Apply-MSPatch -MspPath $mspPath) {
@@ -1194,7 +1506,7 @@ function Install-AdobeReader {
                     return $true
                 } else {
                     Write-Host "Base installation succeeded but patch failed" -ForegroundColor Yellow
-                    return $true
+                    return $true  # Still return true since base install worked
                 }
             }
             return $true
@@ -1204,9 +1516,11 @@ function Install-AdobeReader {
         Write-Host "Method 2 failed with exception: $($_.Exception.Message)"
     }
 
+    # Method 3: Try with transform but fix common path issues - COMPLETELY SILENT
     if (Test-Path $mstPath) {
         try {
             Write-Host "Attempting installation with transform (Method 3)..."
+            # Copy files to temp to avoid path issues
             $tempDir = Join-Path $env:TEMP "AdobeInstall"
             New-Item -Path $tempDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
             
@@ -1217,6 +1531,7 @@ function Install-AdobeReader {
             
             Push-Location $tempDir -ErrorAction SilentlyContinue
             
+            # Try with patch integrated first
             if ($hasPatch) {
                 $transformPatchArgs = @("/i", "AcroRead.msi", "TRANSFORMS=AcroRead.mst", "PATCH=AcroRead.msp", "/qn", "/norestart", "ALLUSERS=1")
                 $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $transformPatchArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
@@ -1229,6 +1544,7 @@ function Install-AdobeReader {
                 }
             }
             
+            # Try without patch
             $transformArgs = @("/i", "AcroRead.msi", "TRANSFORMS=AcroRead.mst", "/qn", "/norestart", "ALLUSERS=1")
             $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $transformArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
             Pop-Location -ErrorAction SilentlyContinue
@@ -1236,6 +1552,7 @@ function Install-AdobeReader {
             if ($process.ExitCode -eq 0) {
                 Write-Host "Adobe Reader base installation with transform successful (Method 3b)" -ForegroundColor Green
                 
+                # Apply patch after installation if available
                 if ($hasPatch) {
                     Write-Host "Applying MSP patch..."
                     $tempMspPath = Join-Path $tempDir "AcroRead.msp"
@@ -1246,7 +1563,7 @@ function Install-AdobeReader {
                     } else {
                         Write-Host "Base installation with transform succeeded but patch failed" -ForegroundColor Yellow
                         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-                        return $true
+                        return $true  # Still return true since base install worked
                     }
                 }
                 Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -1259,6 +1576,7 @@ function Install-AdobeReader {
         }
     }
 
+    # Method 4: Repair Windows Installer and retry - COMPLETELY SILENT
     try {
         Write-Host "Attempting Windows Installer repair and retry (Method 4)..."
         Restart-Service -Name "msiserver" -Force -ErrorAction SilentlyContinue
@@ -1270,6 +1588,7 @@ function Install-AdobeReader {
         if ($process.ExitCode -eq 0) {
             Write-Host "Adobe Reader repair installation successful (Method 4)" -ForegroundColor Green
             
+            # Apply patch after repair if available
             if ($hasPatch) {
                 Write-Host "Applying MSP patch after repair..."
                 if (Apply-MSPatch -MspPath $mspPath) {
@@ -1277,7 +1596,7 @@ function Install-AdobeReader {
                     return $true
                 } else {
                     Write-Host "Repair installation succeeded but patch failed" -ForegroundColor Yellow
-                    return $true
+                    return $true  # Still return true since repair worked
                 }
             }
             return $true
@@ -1287,14 +1606,17 @@ function Install-AdobeReader {
         Write-Host "Method 4 failed with exception: $($_.Exception.Message)"
     }
 
+    # Method 5: Extract and install manually if it's an EXE disguised as MSI - COMPLETELY SILENT
     try {
         Write-Host "Attempting direct executable installation (Method 5)..."
+        # Look for EXE version
         $exePath = Join-Path $DeploymentRoot "AcroRead.exe"
         if (Test-Path $exePath) {
             $process = Start-Process -FilePath $exePath -ArgumentList "/sAll", "/rs", "/msi" -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
             if ($process.ExitCode -eq 0) {
                 Write-Host "Adobe Reader executable installation successful (Method 5)" -ForegroundColor Green
                 
+                # Apply patch after exe install if available
                 if ($hasPatch) {
                     Write-Host "Applying MSP patch after executable installation..."
                     if (Apply-MSPatch -MspPath $mspPath) {
@@ -1302,7 +1624,7 @@ function Install-AdobeReader {
                         return $true
                     } else {
                         Write-Host "Executable installation succeeded but patch failed" -ForegroundColor Yellow
-                        return $true
+                        return $true  # Still return true since exe install worked
                     }
                 }
                 return $true
@@ -1327,6 +1649,7 @@ function Apply-MSPatch {
     try {
         Write-Host "Applying MSP patch: $MspPath"
         
+        # Method 1: Apply patch directly
         $patchArgs = @("/p", "`"$MspPath`"", "/qn", "/norestart")
         $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $patchArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
         
@@ -1337,6 +1660,7 @@ function Apply-MSPatch {
         
         Write-Host "Direct patch application failed with exit code: $($process.ExitCode)"
         
+        # Method 2: Try to identify the product and apply patch
         $adobeProducts = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Adobe*Reader*" -or $_.Name -like "*Acrobat*Reader*" }
         
         if ($adobeProducts) {
@@ -1364,7 +1688,6 @@ function Apply-MSPatch {
         return $false
     }
 }
-
 function Install-VPN {
     $vpnInstaller = Join-Path $DeploymentRoot "silent.bat"
     if (-not (Test-Path $vpnInstaller)) {
@@ -1482,6 +1805,7 @@ function Run-WindowsUpdates {
         Write-Output "winupdate progress: 0"
         Write-Host "=== OPTIMIZED WINDOWS UPDATES (HIGH-SPEED MODE) ===" -ForegroundColor Cyan
         
+        # Method 1: Registry trigger (fastest - triggers background update)
         Write-Host "Method 1: Triggering updates via registry..." -ForegroundColor Yellow
         try {
             $wuRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
@@ -1495,9 +1819,11 @@ function Run-WindowsUpdates {
             Write-Host "Registry trigger failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         
+        # Method 2: UsoClient (native, very fast)
         Write-Host "Method 2: Using UsoClient for rapid updates..." -ForegroundColor Yellow
         $usoSuccess = $false
         try {
+            # Start update scan
             Write-Host "  - Starting update scan..."
             $usoScanJob = Start-Job -ScriptBlock {
                 try {
@@ -1516,6 +1842,7 @@ function Run-WindowsUpdates {
                 Write-Host "  - Scan completed, starting downloads..."
                 Write-Output "winupdate progress: 25"
                 
+                # Start downloads
                 $usoDownloadJob = Start-Job -ScriptBlock {
                     try {
                         & UsoClient.exe StartDownload 2>&1 | Out-Null
@@ -1529,6 +1856,7 @@ function Run-WindowsUpdates {
                 Remove-Job $usoDownloadJob -Force -ErrorAction SilentlyContinue
                 Write-Output "winupdate progress: 50"
                 
+                # Start install
                 Write-Host "  - Starting installation..."
                 $usoInstallJob = Start-Job -ScriptBlock {
                     try {
@@ -1556,6 +1884,7 @@ function Run-WindowsUpdates {
             return $true
         }
         
+        # Method 3: Windows Update Assistant (if available)
         Write-Host "Method 3: Trying Windows Update Assistant..." -ForegroundColor Yellow
         try {
             $wuaPath = Join-Path $DeploymentRoot "Windows10Upgrade9252.exe"
@@ -1586,10 +1915,12 @@ function Run-WindowsUpdates {
             Write-Host "Windows Update Assistant failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         
+        # Method 4: PSWindowsUpdate module (fallback, slower but reliable)
         Write-Host "Method 4: Using PSWindowsUpdate module (this may take longer)..." -ForegroundColor Yellow
         Write-Output "winupdate progress: 15"
         
         try {
+            # Quick module installation in background
             $moduleJob = Start-Job -ScriptBlock {
                 try {
                     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -1598,11 +1929,13 @@ function Run-WindowsUpdates {
                     $ProgressPreference = 'SilentlyContinue'
                     $ErrorActionPreference = 'SilentlyContinue'
                     
+                    # Try to use existing module first
                     if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
                         Import-Module PSWindowsUpdate -Force
                         return $true
                     }
                     
+                    # Install if not available
                     Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -MinimumVersion 2.8.5.201 | Out-Null
                     Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck | Out-Null
                     Import-Module PSWindowsUpdate -Force
@@ -1624,11 +1957,13 @@ function Run-WindowsUpdates {
             Write-Output "winupdate progress: 30"
             Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
             
+            # Fast update installation - critical updates only
             Write-Host "  - Scanning for critical updates..."
             $updateJob = Start-Job -ScriptBlock {
                 try {
                     Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
                     
+                    # Get only security and critical updates under 200MB
                     $updates = Get-WindowsUpdate -MicrosoftUpdate -Criteria "IsInstalled=0 and Type='Software' and BrowseOnly=0" -ErrorAction SilentlyContinue |
                         Where-Object { 
                             ($_.MsrcSeverity -eq 'Critical' -or $_.MsrcSeverity -eq 'Important') -and 
@@ -1637,10 +1972,12 @@ function Run-WindowsUpdates {
                         Select-Object -First 10
                     
                     if ($updates) {
+                        # Install in parallel batches
                         $updates | ForEach-Object -Parallel {
                             try {
                                 Install-WindowsUpdate -KBArticleID $_.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
                             } catch {
+                                # Silent failure per update
                             }
                         } -ThrottleLimit 3
                         
@@ -1654,6 +1991,7 @@ function Run-WindowsUpdates {
             
             Write-Output "winupdate progress: 40"
             
+            # Monitor update job with timeout
             $updateTimeout = 900
             $updateStartTime = Get-Date
             $lastProgress = 40
@@ -1692,6 +2030,7 @@ function Run-WindowsUpdates {
             Write-Host "PSWindowsUpdate method failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         
+        # If all methods fail, still return success with a warning
         Write-Output "winupdate progress: 100"
         Write-Host "Windows Updates triggered but verification incomplete - updates will continue in background" -ForegroundColor Yellow
         return $true
@@ -1702,248 +2041,3 @@ function Run-WindowsUpdates {
         return $false
     }
 }
-
-function Restore-SystemSettings {
-    Write-Host "=== RESTORING SYSTEM SETTINGS ===" -ForegroundColor Cyan
-    
-    try {
-        if ($script:DefenderDisabled) {
-            try {
-                Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
-                Write-Host "Restored Windows Defender real-time protection" -ForegroundColor Green
-            } catch {
-            }
-        }
-        
-        if ($script:OriginalPowerPlan) {
-            try {
-                powercfg /setactive $script:OriginalPowerPlan | Out-Null 2>&1
-                Write-Host "Restored original power plan: $script:OriginalPowerPlan" -ForegroundColor Green
-            } catch {
-            }
-        }
-        
-        try {
-            $currentProcess = Get-Process -Id $PID
-            $currentProcess.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
-            Write-Host "Reset process priority to normal"
-        } catch {
-        }
-        
-        $servicesToRestart = @("Themes", "TabletInputService")
-        foreach ($service in $servicesToRestart) {
-            try {
-                Start-Service $service -ErrorAction SilentlyContinue
-                Write-Host "Restarted service: $service"
-            } catch {
-            }
-        }
-        
-        Write-Host "System settings restoration completed" -ForegroundColor Green
-        
-    } catch {
-    }
-}
-
-function Complete-Deployment {
-    param([hashtable]$Results)
-    
-    Write-Host "`n=== DEPLOYMENT COMPLETION ===" -ForegroundColor Green
-    
-    try {
-        $totalTime = (Get-Date) - $script:DeploymentStartTime
-        Write-Host "Total deployment time: $($totalTime.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
-        
-        Write-Host "`nDeployment Results:" -ForegroundColor Yellow
-        foreach ($key in $Results.Keys) {
-            $status = if ($Results[$key]) { "SUCCESS" } else { "FAILED" }
-            $color = if ($Results[$key]) { "Green" } else { "Red" }
-            Write-Host "  $key`: $status" -ForegroundColor $color
-        }
-        
-        $jobs = Get-Job -ErrorAction SilentlyContinue
-        foreach ($job in $jobs) {
-            if ($job.State -in @('Completed', 'Failed', 'Stopped')) {
-                Remove-Job $job -Force -ErrorAction SilentlyContinue
-            }
-        }
-        
-        $tempFiles = @(
-            "$env:TEMP\AdobeReader_*.log",
-            "$env:TEMP\OfficeUninstall.log",
-            "$env:TEMP\AdobeInstall"
-        )
-        foreach ($pattern in $tempFiles) {
-            Get-ChildItem $pattern -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-        }
-        
-        Write-Host "`n=== DEPLOYMENT COMPLETED SUCCESSFULLY ===" -ForegroundColor Green
-        Write-Host "REBOOT REQUIRED to complete installation" -ForegroundColor Yellow
-        Write-Host "Remote management is now enabled for future maintenance" -ForegroundColor Cyan
-        
-    } finally {
-        Restore-SystemSettings
-        
-        Stop-Transcript -ErrorAction SilentlyContinue
-    }
-}
-
-Write-Host "=== PSI DEPLOYMENT TOOL - OPTIMIZED HIGH-SPEED VERSION ===" -ForegroundColor Green
-
-Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Pre-staging installation files"
-
-Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone"
-
-Write-Host "Loading domain credentials from: $DeploymentRoot"
-$Credential = Get-DomainCredential -ScriptDirectory $DeploymentRoot
-
-if ($Credential) {
-    Write-Host "Credentials loaded successfully" -ForegroundColor Green
-} else {
-    Write-Host "WARNING: Failed to load credentials - domain operations will be skipped" -ForegroundColor Yellow
-}
-
-Set-TimeZoneFromUserInput
-
-Write-DeploymentProgress -CurrentStep 3 -TotalSteps 15 -StepDescription "Domain operations (parallel with software installation)"
-
-$domainJob = Start-Job -ScriptBlock {
-    param($location, $computerName, $credential)
-    
-    $domainJoined = $false
-    $computerRenamed = $false
-    
-    if ($credential) {
-        $servers = switch ($location.ToUpper()) {
-            "GEORGIA"  { @("GA-DC02") }
-            "ARKANSAS" { @("AR-DC", "10.1.199.2") }
-            "IDAHO"    { @("ID-DC") }
-            Default    { @("GA-DC02") }
-        }
-        
-        $networkOk = $true
-        foreach ($server in $servers) {
-            if (-not (Test-Connection -ComputerName $server -Count 1 -Quiet -TimeoutSeconds 5 -ErrorAction SilentlyContinue)) {
-                $networkOk = $false
-                break
-            }
-        }
-        
-        if ($networkOk) {
-            try {
-                switch ($location.ToUpper()) {
-                    "GEORGIA" {
-                        Add-Computer -DomainName "psi-pac.com" -Server "GA-DC02" -Credential $credential -Force -ErrorAction Stop | Out-Null
-                        $domainJoined = $true
-                    }
-                    "ARKANSAS" {
-                        Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "10.1.199.2" -ErrorAction Stop | Out-Null
-                        Add-Computer -DomainName "psi-pac.com" -Server "AR-DC" -Credential $credential -Force -ErrorAction Stop
-                        $domainJoined = $true
-                    }
-                    "IDAHO" {
-                        Add-Computer -DomainName "psi-pac.com" -Server "ID-DC" -Credential $credential -Force -ErrorAction Stop | Out-Null
-                        $domainJoined = $true
-                    }
-                }
-            } catch {
-            }
-            
-            if (-not [string]::IsNullOrWhiteSpace($computerName)) {
-                try {
-                    if ($domainJoined) {
-                        Rename-Computer -NewName $computerName -Force -DomainCredential $credential -ErrorAction Stop | Out-Null
-                    } else {
-                        Rename-Computer -NewName $computerName -Force -ErrorAction Stop | Out-Null
-                    }
-                    $computerRenamed = $true
-                } catch {
-                }
-            }
-        }
-    }
-    
-    return @{
-        DomainJoined = $domainJoined
-        ComputerRenamed = $computerRenamed
-    }
-} -ArgumentList $location, $computerName, $Credential
-
-Write-DeploymentProgress -CurrentStep 4 -TotalSteps 15 -StepDescription "Starting parallel software installations"
-
-Start-ParallelInstallations
-
-Write-DeploymentProgress -CurrentStep 5 -TotalSteps 15 -StepDescription "Adobe Reader installation (with 1624 fix)"
-$adobeInstalled = Install-AdobeReader
-
-Write-DeploymentProgress -CurrentStep 6 -TotalSteps 15 -StepDescription "Office 365 removal (zero-popup automation)"
-Remove-Office365
-
-Write-Host "Performing aggressive Office cleanup..." -ForegroundColor Yellow
-$cleanupSuccess = Complete-OfficeRemoval
-
-Start-Sleep -Seconds 10
-
-Write-DeploymentProgress -CurrentStep 7 -TotalSteps 15 -StepDescription "Office 365 installation"
-if ($cleanupSuccess) {
-    $officeInstalled = Install-Office365
-} else {
-    Write-Host "Office cleanup incomplete - installation may fail. Consider manual reboot." -ForegroundColor Yellow
-    $officeInstalled = Install-Office365
-}
-
-Write-DeploymentProgress -CurrentStep 8 -TotalSteps 15 -StepDescription "VPN and Vantage (if requested)"
-$vpnInstalled = if ($installVPN) {
-    if (Install-VPN) {
-        Install-VPNProfile
-        $true
-    } else { $false }
-} else { $null }
-
-if ($installVANTAGE) { 
-    Install-Vantage -location $location 
-}
-
-Write-DeploymentProgress -CurrentStep 9 -TotalSteps 15 -StepDescription "Shared drives and logging"
-Install-SharedDriveTask -Location $location
-Switch-Logs
-
-Write-DeploymentProgress -CurrentStep 10 -TotalSteps 15 -StepDescription "Waiting for domain operations to complete"
-$domainResults = Wait-Job $domainJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $domainJob -Force -ErrorAction SilentlyContinue
-
-Write-DeploymentProgress -CurrentStep 11 -TotalSteps 15 -StepDescription "Starting optimized Windows Updates (high-speed mode)"
-$updatesJob = Start-Job -ScriptBlock ${function:Run-WindowsUpdates}
-
-Write-DeploymentProgress -CurrentStep 12 -TotalSteps 15 -StepDescription "Final verification and cleanup"
-
-$verificationJob = Verify-Installations
-
-Write-Host "Waiting for Windows Updates to complete (max 20 minutes)..." -ForegroundColor Yellow
-$updateResult = Wait-Job $updatesJob -Timeout 1200 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $updatesJob -Force -ErrorAction SilentlyContinue
-
-if ($updateResult) {
-    Write-Host "Windows Updates: Completed" -ForegroundColor Green
-} else {
-    Write-Host "Windows Updates: Continuing in background" -ForegroundColor Yellow
-}
-
-$verificationResults = Wait-Job $verificationJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $verificationJob -Force -ErrorAction SilentlyContinue
-
-Write-DeploymentProgress -CurrentStep 13 -TotalSteps 15 -StepDescription "Finalizing deployment"
-
-$deploymentResults = @{
-    "Domain Join" = $domainResults.DomainJoined
-    "Computer Rename" = $domainResults.ComputerRenamed
-    "Adobe Reader" = $adobeInstalled
-    "Office 365" = $officeInstalled
-    "Windows Updates" = ($updateResult -ne $null)
-}
-
-if ($installVPN) { $deploymentResults["VPN"] = $vpnInstalled }
-
-Write-DeploymentProgress -CurrentStep 14 -TotalSteps 15 -StepDescription "Deployment complete"
-
-Complete-Deployment -Results $deploymentResults
