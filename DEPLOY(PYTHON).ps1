@@ -1044,13 +1044,39 @@ function Install-Vantage {
     Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
     Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
     
-    # Install Vantage dependencies
-    Write-Host "Installing Vantage dependencies..." -ForegroundColor Cyan
+    # START .NET FRAMEWORK IN BACKGROUND (COMPLETELY SILENT)
+    Write-Host "Starting .NET Framework 3.5 installation in background (silent mode)..." -ForegroundColor Cyan
+    $dotnetPath = "$DeploymentRoot\dotNetFx35Setup.exe"
+    $dotnetJob = $null
+    
+    if (Test-Path $dotnetPath) {
+        # Check if already installed
+        $dotnetCheck = Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue
+        if ($dotnetCheck -and $dotnetCheck.State -eq 'Enabled') {
+            Write-Host ".NET Framework 3.5 already enabled, skipping installation" -ForegroundColor Green
+        } else {
+            $dotnetJob = Start-Job -ScriptBlock {
+                param($path)
+                try {
+                    # COMPLETELY SILENT: /q = quiet, /norestart = no reboot
+                    $proc = Start-Process -FilePath $path -ArgumentList "/q", "/norestart" -PassThru -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+                    return @{Success=$true; ExitCode=$proc.ExitCode}
+                } catch {
+                    return @{Success=$false; Error=$_.Exception.Message}
+                }
+            } -ArgumentList $dotnetPath
+            Write-Host ".NET Framework 3.5 running silently in background..."
+        }
+    } else {
+        Write-Host ".NET Framework installer not found: $dotnetPath" -ForegroundColor Yellow
+    }
+    
+    # Install Vantage dependencies (MSIs must run SEQUENTIALLY)
+    Write-Host "Installing Vantage MSI dependencies sequentially..." -ForegroundColor Cyan
     $installSteps = @(
-        @{ Path = "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0"; Timeout = 120 },
-        @{ Path = "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 95; Name = "Crystal Reports"; Timeout = 180 },
-        @{ Path = "$DeploymentRoot\dotNetFx35Setup.exe"; Percent = 98; Name = ".NET Framework 3.5"; Timeout = 300 },
-        @{ Path = "$DeploymentRoot\sqlncli.msi"; Percent = 99; Name = "SQL Native Client"; Timeout = 120 }
+        @{ Path = "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0"; Timeout = 300 },
+        @{ Path = "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 94; Name = "Crystal Reports"; Timeout = 600 },
+        @{ Path = "$DeploymentRoot\sqlncli.msi"; Percent = 97; Name = "SQL Native Client"; Timeout = 300 }
     )
     
     foreach ($step in $installSteps) {
@@ -1074,6 +1100,21 @@ function Install-Vantage {
             Write-Host "Dependency not found: $($step.Name) at $($step.Path)" -ForegroundColor Yellow
         }
     }
+
+    # Wait for .NET Framework background job to complete (if it was started)
+    if ($dotnetJob) {
+        Write-Host "Waiting for .NET Framework 3.5 background installation to complete..." -ForegroundColor Cyan
+        $dotnetResult = Wait-Job $dotnetJob -Timeout 600 | Receive-Job -ErrorAction SilentlyContinue
+        Remove-Job $dotnetJob -Force -ErrorAction SilentlyContinue
+        
+        if ($dotnetResult.Success) {
+            Write-Host ".NET Framework 3.5 installation completed (Exit code: $($dotnetResult.ExitCode))" -ForegroundColor Green
+        } else {
+            Write-Host ".NET Framework 3.5 installation encountered issues: $($dotnetResult.Error)" -ForegroundColor Yellow
+        }
+    }
+    
+    Write-Output "vantage progress: 99"
 
     # Copy desktop shortcut
     $desktopPath = "$env:PUBLIC\Desktop"
