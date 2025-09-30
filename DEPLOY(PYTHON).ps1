@@ -194,12 +194,6 @@ if (-not $computerName) {
     Write-Host "Received Computer Name: $computerName" 
 }
 
-Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Optimizing system performance for deployment"
-Optimize-DeploymentPerformance
-
-Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Enabling remote management capabilities"
-Enable-RemoteManagement
-
 function Get-DomainCredential {
     param([string]$ScriptDirectory = $DeploymentRoot)  
     
@@ -2041,3 +2035,255 @@ function Run-WindowsUpdates {
         return $false
     }
 }
+function Restore-SystemSettings {
+    Write-Host "=== RESTORING SYSTEM SETTINGS ===" -ForegroundColor Cyan
+    
+    try {
+        if ($script:DefenderDisabled) {
+            try {
+                Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+                Write-Host "Restored Windows Defender real-time protection" -ForegroundColor Green
+            } catch {
+            }
+        }
+        
+        if ($script:OriginalPowerPlan) {
+            try {
+                powercfg /setactive $script:OriginalPowerPlan | Out-Null 2>&1
+                Write-Host "Restored original power plan: $script:OriginalPowerPlan" -ForegroundColor Green
+            } catch {
+            }
+        }
+        
+        try {
+            $currentProcess = Get-Process -Id $PID
+            $currentProcess.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
+            Write-Host "Reset process priority to normal"
+        } catch {
+        }
+        
+        $servicesToRestart = @("Themes", "TabletInputService")
+        foreach ($service in $servicesToRestart) {
+            try {
+                Start-Service $service -ErrorAction SilentlyContinue
+                Write-Host "Restarted service: $service"
+            } catch {
+            }
+        }
+        
+        Write-Host "System settings restoration completed" -ForegroundColor Green
+        
+    } catch {
+    }
+}
+
+function Complete-Deployment {
+    param([hashtable]$Results)
+    
+    Write-Host "`n=== DEPLOYMENT COMPLETION ===" -ForegroundColor Green
+    
+    try {
+        $totalTime = (Get-Date) - $script:DeploymentStartTime
+        Write-Host "Total deployment time: $($totalTime.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
+        
+        Write-Host "`nDeployment Results:" -ForegroundColor Yellow
+        foreach ($key in $Results.Keys) {
+            $status = if ($Results[$key]) { "SUCCESS" } else { "FAILED" }
+            $color = if ($Results[$key]) { "Green" } else { "Red" }
+            Write-Host "  $key`: $status" -ForegroundColor $color
+        }
+        
+        $jobs = Get-Job -ErrorAction SilentlyContinue
+        foreach ($job in $jobs) {
+            if ($job.State -in @('Completed', 'Failed', 'Stopped')) {
+                Remove-Job $job -Force -ErrorAction SilentlyContinue
+            }
+        }
+        
+        $tempFiles = @(
+            "$env:TEMP\AdobeReader_*.log",
+            "$env:TEMP\OfficeUninstall.log",
+            "$env:TEMP\AdobeInstall"
+        )
+        foreach ($pattern in $tempFiles) {
+            Get-ChildItem $pattern -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+        }
+        
+        Write-Host "`n=== DEPLOYMENT COMPLETED SUCCESSFULLY ===" -ForegroundColor Green
+        Write-Host "REBOOT REQUIRED to complete installation" -ForegroundColor Yellow
+        Write-Host "Remote management is now enabled for future maintenance" -ForegroundColor Cyan
+        
+    } finally {
+        Restore-SystemSettings
+        
+        Stop-Transcript -ErrorAction SilentlyContinue
+    }
+}
+
+# ============================================================================
+# MAIN EXECUTION STARTS HERE
+# ============================================================================
+
+Write-Host "=== PSI DEPLOYMENT TOOL - OPTIMIZED HIGH-SPEED VERSION ===" -ForegroundColor Green
+
+Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Optimizing system performance for deployment"
+Optimize-DeploymentPerformance
+
+Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Enabling remote management capabilities"
+Enable-RemoteManagement
+
+Write-DeploymentProgress -CurrentStep 3 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone"
+
+Write-Host "Loading domain credentials from: $DeploymentRoot"
+$Credential = Get-DomainCredential -ScriptDirectory $DeploymentRoot
+
+if ($Credential) {
+    Write-Host "Credentials loaded successfully" -ForegroundColor Green
+} else {
+    Write-Host "WARNING: Failed to load credentials - domain operations will be skipped" -ForegroundColor Yellow
+}
+
+Set-TimeZoneFromUserInput
+
+Write-DeploymentProgress -CurrentStep 4 -TotalSteps 15 -StepDescription "Domain operations (parallel with software installation)"
+
+$domainJob = Start-Job -ScriptBlock {
+    param($location, $computerName, $credential)
+    
+    $domainJoined = $false
+    $computerRenamed = $false
+    
+    if ($credential) {
+        $servers = switch ($location.ToUpper()) {
+            "GEORGIA"  { @("GA-DC02") }
+            "ARKANSAS" { @("AR-DC", "10.1.199.2") }
+            "IDAHO"    { @("ID-DC") }
+            Default    { @("GA-DC02") }
+        }
+        
+        $networkOk = $true
+        foreach ($server in $servers) {
+            if (-not (Test-Connection -ComputerName $server -Count 1 -Quiet -TimeoutSeconds 5 -ErrorAction SilentlyContinue)) {
+                $networkOk = $false
+                break
+            }
+        }
+        
+        if ($networkOk) {
+            try {
+                switch ($location.ToUpper()) {
+                    "GEORGIA" {
+                        Add-Computer -DomainName "psi-pac.com" -Server "GA-DC02" -Credential $credential -Force -ErrorAction Stop | Out-Null
+                        $domainJoined = $true
+                    }
+                    "ARKANSAS" {
+                        Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "10.1.199.2" -ErrorAction Stop | Out-Null
+                        Add-Computer -DomainName "psi-pac.com" -Server "AR-DC" -Credential $credential -Force -ErrorAction Stop
+                        $domainJoined = $true
+                    }
+                    "IDAHO" {
+                        Add-Computer -DomainName "psi-pac.com" -Server "ID-DC" -Credential $credential -Force -ErrorAction Stop | Out-Null
+                        $domainJoined = $true
+                    }
+                }
+            } catch {
+            }
+            
+            if (-not [string]::IsNullOrWhiteSpace($computerName)) {
+                try {
+                    if ($domainJoined) {
+                        Rename-Computer -NewName $computerName -Force -DomainCredential $credential -ErrorAction Stop | Out-Null
+                    } else {
+                        Rename-Computer -NewName $computerName -Force -ErrorAction Stop | Out-Null
+                    }
+                    $computerRenamed = $true
+                } catch {
+                }
+            }
+        }
+    }
+    
+    return @{
+        DomainJoined = $domainJoined
+        ComputerRenamed = $computerRenamed
+    }
+} -ArgumentList $location, $computerName, $Credential
+
+Write-DeploymentProgress -CurrentStep 5 -TotalSteps 15 -StepDescription "Starting parallel software installations"
+
+Start-ParallelInstallations
+
+Write-DeploymentProgress -CurrentStep 6 -TotalSteps 15 -StepDescription "Adobe Reader installation (with 1624 fix)"
+$adobeInstalled = Install-AdobeReader
+
+Write-DeploymentProgress -CurrentStep 7 -TotalSteps 15 -StepDescription "Office 365 removal (zero-popup automation)"
+Remove-Office365
+
+Write-Host "Performing aggressive Office cleanup..." -ForegroundColor Yellow
+$cleanupSuccess = Complete-OfficeRemoval
+
+Start-Sleep -Seconds 10
+
+Write-DeploymentProgress -CurrentStep 8 -TotalSteps 15 -StepDescription "Office 365 installation"
+if ($cleanupSuccess) {
+    $officeInstalled = Install-Office365
+} else {
+    Write-Host "Office cleanup incomplete - installation may fail. Consider manual reboot." -ForegroundColor Yellow
+    $officeInstalled = Install-Office365
+}
+
+Write-DeploymentProgress -CurrentStep 9 -TotalSteps 15 -StepDescription "VPN and Vantage (if requested)"
+$vpnInstalled = if ($installVPN) {
+    if (Install-VPN) {
+        Install-VPNProfile
+        $true
+    } else { $false }
+} else { $null }
+
+if ($installVANTAGE) { 
+    Install-Vantage -location $location 
+}
+
+Write-DeploymentProgress -CurrentStep 10 -TotalSteps 15 -StepDescription "Shared drives and logging"
+Install-SharedDriveTask -Location $location
+Switch-Logs
+
+Write-DeploymentProgress -CurrentStep 11 -TotalSteps 15 -StepDescription "Waiting for domain operations to complete"
+$domainResults = Wait-Job $domainJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
+Remove-Job $domainJob -Force -ErrorAction SilentlyContinue
+
+Write-DeploymentProgress -CurrentStep 12 -TotalSteps 15 -StepDescription "Starting optimized Windows Updates (high-speed mode)"
+$updatesJob = Start-Job -ScriptBlock ${function:Run-WindowsUpdates}
+
+Write-DeploymentProgress -CurrentStep 13 -TotalSteps 15 -StepDescription "Final verification and cleanup"
+
+$verificationJob = Verify-Installations
+
+Write-Host "Waiting for Windows Updates to complete (max 20 minutes)..." -ForegroundColor Yellow
+$updateResult = Wait-Job $updatesJob -Timeout 1200 | Receive-Job -ErrorAction SilentlyContinue
+Remove-Job $updatesJob -Force -ErrorAction SilentlyContinue
+
+if ($updateResult) {
+    Write-Host "Windows Updates: Completed" -ForegroundColor Green
+} else {
+    Write-Host "Windows Updates: Continuing in background" -ForegroundColor Yellow
+}
+
+$verificationResults = Wait-Job $verificationJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
+Remove-Job $verificationJob -Force -ErrorAction SilentlyContinue
+
+Write-DeploymentProgress -CurrentStep 14 -TotalSteps 15 -StepDescription "Finalizing deployment"
+
+$deploymentResults = @{
+    "Domain Join" = $domainResults.DomainJoined
+    "Computer Rename" = $domainResults.ComputerRenamed
+    "Adobe Reader" = $adobeInstalled
+    "Office 365" = $officeInstalled
+    "Windows Updates" = ($updateResult -ne $null)
+}
+
+if ($installVPN) { $deploymentResults["VPN"] = $vpnInstalled }
+
+Write-DeploymentProgress -CurrentStep 15 -TotalSteps 15 -StepDescription "Deployment complete"
+
+Complete-Deployment -Results $deploymentResults
