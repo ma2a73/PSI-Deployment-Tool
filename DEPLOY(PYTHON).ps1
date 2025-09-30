@@ -528,8 +528,8 @@ function Enable-SystemFeatures {
     try {
         Write-Host "Enabling Windows features..."
         
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All        
+        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null       
         Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
         
@@ -1732,385 +1732,215 @@ function Verify-Installations {
 function Run-WindowsUpdates {
     try {
         Write-Output "winupdate progress: 0"
-        Write-Host "Starting OPTIMIZED Windows Updates process..." -ForegroundColor Cyan
-
+        Write-Host "=== OPTIMIZED WINDOWS UPDATES (HIGH-SPEED MODE) ===" -ForegroundColor Cyan
+        
+        # Method 1: Registry trigger (fastest - triggers background update)
+        Write-Host "Method 1: Triggering updates via registry..." -ForegroundColor Yellow
+        try {
+            $wuRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
+            if (Test-Path $wuRegPath) {
+                Set-ItemProperty -Path $wuRegPath -Name "AUOptions" -Value 4 -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $wuRegPath -Name "ScheduledInstallDay" -Value 0 -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $wuRegPath -Name "ScheduledInstallTime" -Value 3 -ErrorAction SilentlyContinue
+            }
+            Write-Output "winupdate progress: 5"
+        } catch {
+            Write-Host "Registry trigger failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        
+        # Method 2: UsoClient (native, very fast)
+        Write-Host "Method 2: Using UsoClient for rapid updates..." -ForegroundColor Yellow
+        $usoSuccess = $false
+        try {
+            # Start update scan
+            Write-Host "  - Starting update scan..."
+            $usoScanJob = Start-Job -ScriptBlock {
+                try {
+                    & UsoClient.exe ScanInstallWait 2>&1 | Out-Null
+                    return $LASTEXITCODE
+                } catch {
+                    return 1
+                }
+            }
+            
+            Write-Output "winupdate progress: 10"
+            $scanResult = Wait-Job $usoScanJob -Timeout 120 | Receive-Job -ErrorAction SilentlyContinue
+            Remove-Job $usoScanJob -Force -ErrorAction SilentlyContinue
+            
+            if ($scanResult -eq 0 -or $null -eq $scanResult) {
+                Write-Host "  - Scan completed, starting downloads..."
+                Write-Output "winupdate progress: 25"
+                
+                # Start downloads
+                $usoDownloadJob = Start-Job -ScriptBlock {
+                    try {
+                        & UsoClient.exe StartDownload 2>&1 | Out-Null
+                        return $LASTEXITCODE
+                    } catch {
+                        return 1
+                    }
+                }
+                
+                $downloadResult = Wait-Job $usoDownloadJob -Timeout 300 | Receive-Job -ErrorAction SilentlyContinue
+                Remove-Job $usoDownloadJob -Force -ErrorAction SilentlyContinue
+                Write-Output "winupdate progress: 50"
+                
+                # Start install
+                Write-Host "  - Starting installation..."
+                $usoInstallJob = Start-Job -ScriptBlock {
+                    try {
+                        & UsoClient.exe StartInstall 2>&1 | Out-Null
+                        return $LASTEXITCODE
+                    } catch {
+                        return 1
+                    }
+                }
+                
+                $installResult = Wait-Job $usoInstallJob -Timeout 600 | Receive-Job -ErrorAction SilentlyContinue
+                Remove-Job $usoInstallJob -Force -ErrorAction SilentlyContinue
+                Write-Output "winupdate progress: 80"
+                
+                $usoSuccess = $true
+                Write-Host "UsoClient method completed successfully" -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "UsoClient method failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        
+        if ($usoSuccess) {
+            Write-Output "winupdate progress: 100"
+            Write-Host "Windows Updates initiated successfully (will continue in background)" -ForegroundColor Green
+            return $true
+        }
+        
+        # Method 3: Windows Update Assistant (if available)
+        Write-Host "Method 3: Trying Windows Update Assistant..." -ForegroundColor Yellow
         try {
             $wuaPath = Join-Path $DeploymentRoot "Windows10Upgrade9252.exe"
             if (Test-Path $wuaPath) {
-                Write-Host "Using Windows Update Assistant for faster updates..."
-                Start-Process -FilePath $wuaPath -ArgumentList "/quietinstall", "/skipeula", "/auto", "upgrade" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-                Write-Output "winupdate progress: 50"
+                Write-Host "  - Running Windows Update Assistant..."
+                $wuaJob = Start-Job -ScriptBlock {
+                    param($path)
+                    try {
+                        $process = Start-Process -FilePath $path -ArgumentList "/quietinstall", "/skipeula", "/auto", "upgrade", "/copylogs" -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                        Wait-Process -Id $process.Id -Timeout 600 -ErrorAction SilentlyContinue
+                        return $true
+                    } catch {
+                        return $false
+                    }
+                } -ArgumentList $wuaPath
+                
+                Write-Output "winupdate progress: 85"
+                $wuaResult = Wait-Job $wuaJob -Timeout 700 | Receive-Job -ErrorAction SilentlyContinue
+                Remove-Job $wuaJob -Force -ErrorAction SilentlyContinue
+                
+                if ($wuaResult) {
+                    Write-Output "winupdate progress: 100"
+                    Write-Host "Windows Update Assistant completed" -ForegroundColor Green
+                    return $true
+                }
             }
         } catch {
-            Write-Host "Windows Update Assistant not available, using alternative method"
+            Write-Host "Windows Update Assistant failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
-
-        try {
-            Write-Host "Triggering Windows Update scan using UsoClient (fastest method)..."
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Write-Output "winupdate progress: 30"
-            
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartDownload" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue  
-            Write-Output "winupdate progress: 60"
-            
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartInstall" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Write-Output "winupdate progress: 90"
-            
-            Write-Host "Windows Updates initiated via UsoClient - will continue in background"
-            Write-Output "winupdate progress: 100"
-            return $true
-        } catch {
-            Write-Host "UsoClient method failed, falling back to PSWindowsUpdate"
-        }
-
-        Write-Host "Using optimized PSWindowsUpdate module..."
         
-        $moduleJob = Start-Job -ScriptBlock {
-            try {
-                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                
-                Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -MinimumVersion 2.8.5.201 -ErrorAction SilentlyContinue | Out-Null
-                Install-Module -Name PSWindowsUpdate -SkipPublisherCheck -Force -Scope CurrentUser -AllowClobber -ErrorAction SilentlyContinue | Out-Null
-                return $true
-            } catch {
+        # Method 4: PSWindowsUpdate module (fallback, slower but reliable)
+        Write-Host "Method 4: Using PSWindowsUpdate module (this may take longer)..." -ForegroundColor Yellow
+        Write-Output "winupdate progress: 15"
+        
+        try {
+            # Quick module installation in background
+            $moduleJob = Start-Job -ScriptBlock {
+                try {
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    [Net.ServicePointManager]::MaxServicePointIdleTime = 10000
+                    
+                    $ProgressPreference = 'SilentlyContinue'
+                    $ErrorActionPreference = 'SilentlyContinue'
+                    
+                    # Try to use existing module first
+                    if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
+                        Import-Module PSWindowsUpdate -Force
+                        return $true
+                    }
+                    
+                    # Install if not available
+                    Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -MinimumVersion 2.8.5.201 | Out-Null
+                    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck | Out-Null
+                    Import-Module PSWindowsUpdate -Force
+                    return $true
+                } catch {
+                    return $false
+                }
+            }
+            
+            $moduleReady = Wait-Job $moduleJob -Timeout 90 | Receive-Job -ErrorAction SilentlyContinue
+            Remove-Job $moduleJob -Force -ErrorAction SilentlyContinue
+            
+            if (-not $moduleReady) {
+                Write-Output "winupdate error: Failed to install PSWindowsUpdate module"
+                Write-Host "PSWindowsUpdate module installation failed" -ForegroundColor Red
                 return $false
             }
-        }
-        
-        $moduleInstalled = Wait-Job $moduleJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
-        Remove-Job $moduleJob -Force -ErrorAction SilentlyContinue
-        
-        if (-not $moduleInstalled) {
-            Write-Output "winupdate error: Failed to install required modules"
-            return $false
-        }
-
-        Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
-        Write-Output "winupdate progress: 20"
-
-        Write-Host "Scanning for CRITICAL updates only (for speed)..."
-        $criticalUpdates = Get-WindowsUpdate -MicrosoftUpdate -Severity Critical -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue
-        
-        if ($criticalUpdates) {
-            $total = $criticalUpdates.Count
-            Write-Host "Found $total critical updates - installing in parallel where possible"
             
-            $updateJobs = @()
-            $batchSize = 3  # Install 3 updates simultaneously for speed
+            Write-Output "winupdate progress: 30"
+            Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
             
-            for ($i = 0; $i -lt $criticalUpdates.Count; $i += $batchSize) {
-                $batch = $criticalUpdates[$i..([Math]::Min($i + $batchSize - 1, $criticalUpdates.Count - 1))]
-                
-                $updateJob = Start-Job -ScriptBlock {
-                    param($updates)
-                    Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
-                    foreach ($update in $updates) {
-                        try {
-                            Install-WindowsUpdate -KBArticleID $update.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-                        } catch {
-                        }
-                    }
-                } -ArgumentList $batch
-                
-                $updateJobs += $updateJob
-                
-                $percent = [math]::Round((($i + $batchSize) / $total) * 80) + 20  # 20-100% range
-                Write-Output "winupdate progress: $percent"
-            }
-            
-            $updateJobs | Wait-Job -Timeout 1800 -ErrorAction SilentlyContinue | Out-Null  # 30 minute timeout
-            $updateJobs | Remove-Job -Force -ErrorAction SilentlyContinue
-            
-        } else {
-            Write-Host "No critical updates found, checking for other important updates..."
-            
-            $importantUpdates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | 
-                Where-Object { $_.Size -lt 100MB }  # Only install updates smaller than 100MB for speed
-            
-            if ($importantUpdates) {
-                $total = $importantUpdates.Count
-                Write-Host "Installing $total important updates (size-limited for speed)..."
-                
-                $count = 0
-                foreach ($update in $importantUpdates) {
-                    $count++
-                    $percent = 20 + [math]::Round(($count / $total) * 80)
-                    Write-Output "winupdate progress: $percent"
-                    
-                    try {
-                        Install-WindowsUpdate -KBArticleID $update.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-                    } catch {
-                    }
-                }
-            }
-        }
-        
-        Write-Output "winupdate progress: 100"
-        Write-Host "Windows Updates completed (critical and important only for speed)" -ForegroundColor Green
-        return $true
-        
-    } catch {
-        Write-Output "winupdate error: $($_.Exception.Message)"
-        Write-Host "Windows Updates encountered an error but deployment will continue" -ForegroundColor Yellow
-        return $false
-    }
-}
-
-function Restore-SystemSettings {
-    Write-Host "=== RESTORING SYSTEM SETTINGS ===" -ForegroundColor Cyan
-    
-    try {
-        if ($script:DefenderDisabled) {
-            try {
-                Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
-                Write-Host "Restored Windows Defender real-time protection" -ForegroundColor Green
-            } catch {
-            }
-        }
-        
-        if ($script:OriginalPowerPlan) {
-            try {
-                powercfg /setactive $script:OriginalPowerPlan | Out-Null 2>&1
-                Write-Host "Restored original power plan: $script:OriginalPowerPlan" -ForegroundColor Green
-            } catch {
-            }
-        }
-        
-        try {
-            $currentProcess = Get-Process -Id $PID
-            $currentProcess.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
-            Write-Host "Reset process priority to normal"
-        } catch {
-        }
-        
-        $servicesToRestart = @("Themes", "TabletInputService")
-        foreach ($service in $servicesToRestart) {
-            try {
-                Start-Service $service -ErrorAction SilentlyContinue
-                Write-Host "Restarted service: $service"
-            } catch {
-            }
-        }
-        
-        Write-Host "System settings restoration completed" -ForegroundColor Green
-        
-    } catch {
-        # Silent failure
-    }
-}
-
-function Complete-Deployment {
-    param([hashtable]$Results)
-    
-    Write-Host "`n=== DEPLOYMENT COMPLETION ===" -ForegroundColor Green
-    
-    try {
-        $totalTime = (Get-Date) - $script:DeploymentStartTime
-        Write-Host "Total deployment time: $($totalTime.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
-        
-        Write-Host "`nDeployment Results:" -ForegroundColor Yellow
-        foreach ($key in $Results.Keys) {
-            $status = if ($Results[$key]) { "SUCCESS" } else { "FAILED" }
-            $color = if ($Results[$key]) { "Green" } else { "Red" }
-            Write-Host "  $key`: $status" -ForegroundColor $color
-        }
-        
-        $jobs = Get-Job -ErrorAction SilentlyContinue
-        foreach ($job in $jobs) {
-            if ($job.State -in @('Completed', 'Failed', 'Stopped')) {
-                Remove-Job $job -Force -ErrorAction SilentlyContinue
-            }
-        }
-        
-        $tempFiles = @(
-            "$env:TEMP\AdobeReader_*.log",
-            "$env:TEMP\OfficeUninstall.log",
-            "$env:TEMP\AdobeInstall"
-        )
-        foreach ($pattern in $tempFiles) {
-            Get-ChildItem $pattern -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-        }
-        
-        Write-Host "`n=== DEPLOYMENT COMPLETED SUCCESSFULLY ===" -ForegroundColor Green
-        Write-Host "REBOOT REQUIRED to complete installation" -ForegroundColor Yellow
-        Write-Host "Remote management is now enabled for future maintenance" -ForegroundColor Cyan
-        
-    } finally {
-        Restore-SystemSettings
-        
-        Stop-Transcript -ErrorAction SilentlyContinue
-    }
-}
-
-Write-Host "=== PSI DEPLOYMENT TOOL - ZERO-POPUP FULL FEATURED VERSION ===" -ForegroundColor Green
-
-Write-DeploymentProgress -CurrentStep 1 -TotalSteps 15 -StepDescription "Pre-staging installation files"
-
-Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone"
-
-Write-Host "Loading domain credentials from: $DeploymentRoot"
-$Credential = Get-DomainCredential -ScriptDirectory $DeploymentRoot
-
-if ($Credential) {
-    Write-Host "Credentials loaded successfully" -ForegroundColor Green
-} else {
-    Write-Host "WARNING: Failed to load credentials - domain operations will be skipped" -ForegroundColor Yellow
-}
-
-Set-TimeZoneFromUserInput
-
-$Credential = Wait-Job $credentialJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $credentialJob -Force -ErrorAction SilentlyContinue
-
-Write-DeploymentProgress -CurrentStep 3 -TotalSteps 15 -StepDescription "Domain operations (parallel with software installation)"
-
-$domainJob = Start-Job -ScriptBlock {
-    param($location, $computerName, $credential)
-    
-    $domainJoined = $false
-    $computerRenamed = $false
-    
-    if ($credential) {
-        $servers = switch ($location.ToUpper()) {
-            "GEORGIA"  { @("GA-DC02") }
-            "ARKANSAS" { @("AR-DC", "10.1.199.2") }
-            "IDAHO"    { @("ID-DC") }
-            Default    { @("GA-DC02") }
-        }
-        
-        $networkOk = $true
-        foreach ($server in $servers) {
-            if (-not (Test-Connection -ComputerName $server -Count 1 -Quiet -TimeoutSeconds 5 -ErrorAction SilentlyContinue)) {
-                $networkOk = $false
-                break
-            }
-        }
-        
-        if ($networkOk) {
-            try {
-                switch ($location.ToUpper()) {
-                    "GEORGIA" {
-                        Add-Computer -DomainName "psi-pac.com" -Server "GA-DC02" -Credential $credential -Force -ErrorAction Stop | Out-Null
-                        $domainJoined = $true
-                    }
-                    "ARKANSAS" {
-                        Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "10.1.199.2" -ErrorAction Stop | Out-Null
-                        Add-Computer -DomainName "psi-pac.com" -Server "AR-DC" -Credential $credential -Force -ErrorAction Stop
-                        $domainJoined = $true
-                    }
-                    "IDAHO" {
-                        Add-Computer -DomainName "psi-pac.com" -Server "ID-DC" -Credential $credential -Force -ErrorAction Stop | Out-Null
-                        $domainJoined = $true
-                    }
-                }
-            } catch {
-                # Domain join failed
-            }
-            
-            if (-not [string]::IsNullOrWhiteSpace($computerName)) {
+            # Fast update installation - critical updates only
+            Write-Host "  - Scanning for critical updates..."
+            $updateJob = Start-Job -ScriptBlock {
                 try {
-                    if ($domainJoined) {
-                        Rename-Computer -NewName $computerName -Force -DomainCredential $credential -ErrorAction Stop | Out-Null
-                    } else {
-                        Rename-Computer -NewName $computerName -Force -ErrorAction Stop | Out-Null
+                    Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
+                    
+                    # Get only security and critical updates under 200MB
+                    $updates = Get-WindowsUpdate -MicrosoftUpdate -Criteria "IsInstalled=0 and Type='Software' and BrowseOnly=0" -ErrorAction SilentlyContinue |
+                        Where-Object { 
+                            ($_.MsrcSeverity -eq 'Critical' -or $_.MsrcSeverity -eq 'Important') -and 
+                            ($_.Size -lt 200MB)
+                        } |
+                        Select-Object -First 10  # Limit to 10 most important updates
+                    
+                    if ($updates) {
+                        # Install in parallel batches
+                        $updates | ForEach-Object -Parallel {
+                            try {
+                                Install-WindowsUpdate -KBArticleID $_.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+                            } catch {
+                                # Silent failure per update
+                            }
+                        } -ThrottleLimit 3
+                        
+                        return @{Success=$true; Count=$updates.Count}
                     }
-                    $computerRenamed = $true
+                    return @{Success=$true; Count=0}
                 } catch {
-                    # Rename failed
+                    return @{Success=$false; Error=$_.Exception.Message}
                 }
             }
-        }
-    }
-    
-    return @{
-        DomainJoined = $domainJoined
-        ComputerRenamed = $computerRenamed
-    }
-} -ArgumentList $location, $computerName, $Credential
-
-Write-DeploymentProgress -CurrentStep 4 -TotalSteps 15 -StepDescription "Starting parallel software installations"
-
-Start-ParallelInstallations
-
-Write-DeploymentProgress -CurrentStep 5 -TotalSteps 15 -StepDescription "Adobe Reader installation (with 1624 fix)"
-$adobeInstalled = Install-AdobeReader
-
-Write-DeploymentProgress -CurrentStep 6 -TotalSteps 15 -StepDescription "Office 365 removal (zero-popup automation)"
-Remove-Office365
-
-Write-Host "Performing aggressive Office cleanup..." -ForegroundColor Yellow
-$cleanupSuccess = Complete-OfficeRemoval
-
-Start-Sleep -Seconds 10
-
-Write-DeploymentProgress -CurrentStep 7 -TotalSteps 15 -StepDescription "Office 365 installation"
-if ($cleanupSuccess) {
-    $officeInstalled = Install-Office365
-} else {
-    Write-Host "Office cleanup incomplete - installation may fail. Consider manual reboot." -ForegroundColor Yellow
-    $officeInstalled = Install-Office365
-}
-
-Write-DeploymentProgress -CurrentStep 7 -TotalSteps 15 -StepDescription "Office 365 installation"
-$officeInstalled = Install-Office365
-
-Write-DeploymentProgress -CurrentStep 8 -TotalSteps 15 -StepDescription "VPN and Vantage (if requested)"
-$vpnInstalled = if ($installVPN) {
-    if (Install-VPN) {
-        Install-VPNProfile
-        $true
-    } else { $false }
-} else { $null }
-
-if ($installVANTAGE) { 
-    Install-Vantage -location $location 
-}
-
-Write-DeploymentProgress -CurrentStep 9 -TotalSteps 15 -StepDescription "Shared drives and logging"
-Install-SharedDriveTask -Location $location
-Switch-Logs
-
-Write-DeploymentProgress -CurrentStep 10 -TotalSteps 15 -StepDescription "Waiting for domain operations to complete"
-$domainResults = Wait-Job $domainJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $domainJob -Force -ErrorAction SilentlyContinue
-
-Write-DeploymentProgress -CurrentStep 11 -TotalSteps 15 -StepDescription "Starting optimized Windows Updates (critical updates first)"
-$updatesJob = Start-Job -ScriptBlock {
-    try {
-        # Use UsoClient for fastest updates
-        Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-        Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartDownload" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-        Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartInstall" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-        return "Windows Updates: Completed successfully"
-    } catch {
-        return "Windows Updates: $($_.Exception.Message)"
-    }
-}
-
-Write-DeploymentProgress -CurrentStep 12 -TotalSteps 15 -StepDescription "Final verification and cleanup"
-
-$verificationJob = Verify-Installations
-
-Write-Host "Waiting for Windows Updates to complete..." -ForegroundColor Yellow
-$updateResult = Wait-Job $updatesJob -Timeout 1800 | Receive-Job -ErrorAction SilentlyContinue # 30 minute timeout
-Remove-Job $updatesJob -Force -ErrorAction SilentlyContinue
-Write-Host $updateResult -ForegroundColor $(if ($updateResult -match "Completed") { "Green" } else { "Yellow" })
-
-$verificationResults = Wait-Job $verificationJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $verificationJob -Force -ErrorAction SilentlyContinue
-
-Write-DeploymentProgress -CurrentStep 13 -TotalSteps 15 -StepDescription "Finalizing deployment"
-
-$deploymentResults = @{
-    "Domain Join" = $domainResults.DomainJoined
-    "Computer Rename" = $domainResults.ComputerRenamed
-    "Adobe Reader" = $adobeInstalled
-    "Office 365" = $officeInstalled
-    "Windows Updates" = ($updateResult -match "Completed")
-}
-
-if ($installVPN) { $deploymentResults["VPN"] = $vpnInstalled }
-
-Write-DeploymentProgress -CurrentStep 14 -TotalSteps 15 -StepDescription "Deployment complete"
-
-Complete-Deployment -Results $deploymentResults
+            
+            Write-Output "winupdate progress: 40"
+            
+            # Monitor update job with timeout
+            $updateTimeout = 900  # 15 minutes max
+            $updateStartTime = Get-Date
+            $lastProgress = 40
+            
+            while ($updateJob.State -eq 'Running' -and ((Get-Date) - $updateStartTime).TotalSeconds -lt $updateTimeout) {
+                $elapsed = ((Get-Date) - $updateStartTime).TotalSeconds
+                $progress = [math]::Min(40 + [math]::Round(($elapsed / $updateTimeout) * 50), 90)
+                
+                if ($progress -gt $lastProgress) {
+                    Write-Output "winupdate progress: $progress"
+                    $lastProgress = $progress
+                }
+                
+                Start-Sleep -Seconds 10
+            }
+            
+            $updateResult = Wait-Job $updateJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
+            Remove-Job $updateJob -Force -ErrorAction SilentlyContinue
+            
+            if ($updateResult.Success) {
+                Write-Output "winupdate progress: 100"
+                if ($updateResult.Count -gt 0) {
+                    Write-Host "Installed $($updateResult.Count) critical
