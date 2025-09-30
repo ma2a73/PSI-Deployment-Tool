@@ -2295,15 +2295,14 @@ $domainResults = Wait-Job $domainJob -Timeout 60 | Receive-Job -ErrorAction Sile
 Remove-Job $domainJob -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 12 -TotalSteps 15 -StepDescription "Starting optimized Windows Updates (high-speed mode)"
-$updatesJob = Start-Job -ScriptBlock ${function:Run-WindowsUpdates}
+
+# Run Windows Updates directly (not as background job to avoid context issues)
+Write-Host "Running Windows Updates in foreground for reliability..." -ForegroundColor Yellow
+$updateResult = Run-WindowsUpdates
 
 Write-DeploymentProgress -CurrentStep 13 -TotalSteps 15 -StepDescription "Final verification and cleanup"
 
 $verificationJob = Verify-Installations
-
-Write-Host "Waiting for Windows Updates to complete (max 20 minutes)..." -ForegroundColor Yellow
-$updateResult = Wait-Job $updatesJob -Timeout 1200 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $updatesJob -Force -ErrorAction SilentlyContinue
 
 if ($updateResult) {
     Write-Host "Windows Updates: Completed" -ForegroundColor Green
