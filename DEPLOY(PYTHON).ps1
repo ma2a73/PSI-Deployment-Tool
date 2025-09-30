@@ -194,6 +194,7 @@ if (-not $computerName) {
     Write-Host "Received Computer Name: $computerName" 
 }
 
+
 function Get-DomainCredential {
     param([string]$ScriptDirectory = $DeploymentRoot)  
     
@@ -511,8 +512,8 @@ if (-not (Test-Path "`$env:LOCALAPPDATA\SDriveMapped.txt")) {
     New-Item -Path "`$env:LOCALAPPDATA\SDriveMapped.txt" -ItemType File -Force | Out-Null
 }
 "@
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All
+        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart | Out-Null
+        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart | Out-Null
         $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$scriptContent`""
         $trigger = New-ScheduledTaskTrigger -AtLogOn
         $principal = New-ScheduledTaskPrincipal -GroupId "Users" -RunLevel Limited
@@ -630,8 +631,8 @@ function Start-ParallelInstallations {
     
     $featuresJob = Start-Job -Name "Features" -ScriptBlock {
         try {
-            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All
-            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All
+            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -Erroraction SilentlyContinue | Out-Null
+            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -Erroraction SilentlyContinue | Out-Null
             Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
             Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
             return "System Features: Enabled successfully"
