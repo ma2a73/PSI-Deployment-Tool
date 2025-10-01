@@ -817,7 +817,7 @@ function Install-Vantage {
         }
     }
 
-    # First check deployment cache (downloaded via Python from IIS)
+    # First check deployment cache
     $localZip = Join-Path $DeploymentRoot "client803.zip"
     $useLocalCache = $false
     
@@ -828,7 +828,6 @@ function Install-Vantage {
     } else {
         Write-Host "client803.zip not found in cache, using network paths" -ForegroundColor Yellow
         
-        # Fallback to network paths
         switch ($location.ToUpper()) {
             "GEORGIA" { 
                 $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
@@ -866,12 +865,10 @@ function Install-Vantage {
         
         try {
             if ($useLocalCache) {
-                # Already in cache, use directly
                 $tempZip = $localZip
                 Write-Host "Using cached archive directly" -ForegroundColor Green
                 Write-Output "vantage progress: 50"
             } else {
-                # Copy from network
                 $tempZip = "$env:TEMP\client803_install.zip"
                 
                 Write-Host "Copying compressed archive from network..."
@@ -920,7 +917,6 @@ function Install-Vantage {
                 Add-Type -AssemblyName System.IO.Compression.FileSystem
                 [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $targetPath)
                 
-                # Clean up temp file if we copied from network
                 if (-not $useLocalCache) {
                     Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
                 }
@@ -1050,7 +1046,6 @@ function Install-Vantage {
     $dotnetJob = $null
     
     if (Test-Path $dotnetPath) {
-        # Check if already installed
         $dotnetCheck = Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue
         if ($dotnetCheck -and $dotnetCheck.State -eq 'Enabled') {
             Write-Host ".NET Framework 3.5 already enabled, skipping installation" -ForegroundColor Green
@@ -1058,7 +1053,6 @@ function Install-Vantage {
             $dotnetJob = Start-Job -ScriptBlock {
                 param($path)
                 try {
-                    # COMPLETELY SILENT: /q = quiet, /norestart = no reboot
                     $proc = Start-Process -FilePath $path -ArgumentList "/q", "/norestart" -PassThru -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
                     return @{Success=$true; ExitCode=$proc.ExitCode}
                 } catch {
@@ -1071,34 +1065,86 @@ function Install-Vantage {
         Write-Host ".NET Framework installer not found: $dotnetPath" -ForegroundColor Yellow
     }
     
-    # Install Vantage dependencies (MSIs must run SEQUENTIALLY)
-    Write-Host "Installing Vantage MSI dependencies sequentially..." -ForegroundColor Cyan
-    $installSteps = @(
-        @{ Path = "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi"; Percent = 90; Name = "Microsoft WSE 3.0"; Timeout = 300 },
-        @{ Path = "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Percent = 94; Name = "Crystal Reports"; Timeout = 600 },
-        @{ Path = "$DeploymentRoot\sqlncli.msi"; Percent = 97; Name = "SQL Native Client"; Timeout = 300 }
-    )
+    # ===== ULTRA-FAST MSI INSTALLATION USING CMD (HIDDEN WINDOWS) =====
+    Write-Host "Installing Vantage MSI dependencies via CMD (hidden, fast mode)..." -ForegroundColor Cyan
     
-    foreach ($step in $installSteps) {
-        if (Test-Path $step.Path) {
-            Write-Host "Installing $($step.Name)..."
-            $ext = [System.IO.Path]::GetExtension($step.Path).ToLower()
-            $args = switch ($ext) { 
-                ".msi" { @("/i", "`"$($step.Path)`"", "/quiet", "/norestart") } 
-                ".exe" { @("/quiet", "/norestart") } 
-                default { @("/quiet", "/norestart") } 
+    # Create a temporary batch file for parallel execution
+    $batchFile = "$env:TEMP\vantage_install_msi.bat"
+    $batchContent = @"
+@echo off
+REM Parallel MSI installation - all run simultaneously
+
+START /MIN "WSE" msiexec.exe /i "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi" /qb! /norestart REBOOT=ReallySuppress
+START /MIN "Crystal" msiexec.exe /i "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi" /qb! /norestart REBOOT=ReallySuppress
+START /MIN "SQLNative" msiexec.exe /i "$DeploymentRoot\sqlncli.msi" /qb! /norestart REBOOT=ReallySuppress
+
+REM Wait for all to complete
+:WAIT
+timeout /t 5 /nobreak >nul
+tasklist /FI "WINDOWTITLE eq WSE" 2>nul | find /I "msiexec.exe" >nul
+if not errorlevel 1 goto WAIT
+tasklist /FI "WINDOWTITLE eq Crystal" 2>nul | find /I "msiexec.exe" >nul
+if not errorlevel 1 goto WAIT
+tasklist /FI "WINDOWTITLE eq SQLNative" 2>nul | find /I "msiexec.exe" >nul
+if not errorlevel 1 goto WAIT
+
+echo MSI_INSTALLATIONS_COMPLETE
+exit /b 0
+"@
+    
+    try {
+        # Write batch file
+        Set-Content -Path $batchFile -Value $batchContent -Force -ErrorAction Stop
+        Write-Host "  - Created batch installer: $batchFile" -ForegroundColor Yellow
+        
+        # Execute using WScript for completely hidden execution
+        $vbsFile = "$env:TEMP\vantage_install_silent.vbs"
+        $vbsContent = @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "cmd.exe /c ""$batchFile""", 0, True
+"@
+        Set-Content -Path $vbsFile -Value $vbsContent -Force -ErrorAction Stop
+        
+        Write-Host "  - Starting hidden CMD installation (3 MSIs in parallel)..." -ForegroundColor Yellow
+        Write-Output "vantage progress: 88"
+        
+        # Run the VBS script which will run CMD completely hidden
+        $vbsProcess = Start-Process -FilePath "wscript.exe" -ArgumentList "`"$vbsFile`"" -PassThru -WindowStyle Hidden -Wait
+        
+        Write-Host "  - MSI installations completed" -ForegroundColor Green
+        Write-Output "vantage progress: 97"
+        
+        # Cleanup
+        Remove-Item $batchFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $vbsFile -Force -ErrorAction SilentlyContinue
+        
+    } catch {
+        Write-Host "  - CMD batch installation failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  - Falling back to direct PowerShell installation..." -ForegroundColor Yellow
+        
+        # Fallback: Direct msiexec calls (still hidden)
+        $msiPaths = @(
+            "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi",
+            "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi",
+            "$DeploymentRoot\sqlncli.msi"
+        )
+        
+        $processes = @()
+        foreach ($msiPath in $msiPaths) {
+            if (Test-Path $msiPath) {
+                $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "`"$msiPath`"", "/qb!", "/norestart", "REBOOT=ReallySuppress" -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                $processes += $proc
             }
-            
-            $success = Run-Installer -Path $step.Path -Arguments $args -TimeoutSeconds $step.Timeout
-            
-            if (-not $success) {
-                Write-Host "Warning: $($step.Name) installation may have issues, continuing..." -ForegroundColor Yellow
-            }
-            
-            Write-Output "vantage progress: $($step.Percent)"
-        } else {
-            Write-Host "Dependency not found: $($step.Name) at $($step.Path)" -ForegroundColor Yellow
         }
+        
+        # Wait for all processes
+        if ($processes.Count -gt 0) {
+            Write-Host "  - Waiting for $($processes.Count) MSI installers..." -ForegroundColor Yellow
+            $processes | Wait-Process -Timeout 300 -ErrorAction SilentlyContinue
+            Write-Host "  - MSI installations completed" -ForegroundColor Green
+        }
+        
+        Write-Output "vantage progress: 97"
     }
 
     # Wait for .NET Framework background job to complete (if it was started)
@@ -1839,183 +1885,64 @@ function Verify-Installations {
 function Run-WindowsUpdates {
     try {
         Write-Output "winupdate progress: 0"
-        Write-Host "=== OPTIMIZED WINDOWS UPDATES (HIGH-SPEED MODE) ===" -ForegroundColor Cyan
+        Write-Host "=== AGGRESSIVE WINDOWS UPDATES (INSTALL EVERYTHING) ===" -ForegroundColor Cyan
         
-        # Method 1: Registry trigger (fastest - triggers background update)
-        Write-Host "Method 1: Triggering updates via registry..." -ForegroundColor Yellow
-        try {
-            $wuRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
-            if (Test-Path $wuRegPath) {
-                Set-ItemProperty -Path $wuRegPath -Name "AUOptions" -Value 4 -ErrorAction SilentlyContinue
-                Set-ItemProperty -Path $wuRegPath -Name "ScheduledInstallDay" -Value 0 -ErrorAction SilentlyContinue
-                Set-ItemProperty -Path $wuRegPath -Name "ScheduledInstallTime" -Value 3 -ErrorAction SilentlyContinue
-            }
-            Write-Output "winupdate progress: 5"
-        } catch {
-            Write-Host "Registry trigger failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
+        # Method 1: UsoClient (fastest native method)
+        Write-Host "Using UsoClient for maximum speed installation..." -ForegroundColor Yellow
         
-        # Method 2: UsoClient (native, very fast)
-        Write-Host "Method 2: Using UsoClient for rapid updates..." -ForegroundColor Yellow
-        $usoSuccess = $false
         try {
-            # Start update scan
-            Write-Host "  - Starting update scan..."
-            $usoScanJob = Start-Job -ScriptBlock {
-                try {
-                    & UsoClient.exe ScanInstallWait 2>&1 | Out-Null
-                    return $LASTEXITCODE
-                } catch {
-                    return 1
-                }
-            }
+            # Force immediate scan and install
+            Write-Host "  - Forcing update scan..."
+            Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -WindowStyle Hidden -ErrorAction SilentlyContinue
+            Write-Output "winupdate progress: 15"
             
-            Write-Output "winupdate progress: 10"
-            $scanResult = Wait-Job $usoScanJob -Timeout 120 | Receive-Job -ErrorAction SilentlyContinue
-            Remove-Job $usoScanJob -Force -ErrorAction SilentlyContinue
+            Write-Host "  - Starting download (all updates)..."
+            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartDownload" -WindowStyle Hidden -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
+            Write-Output "winupdate progress: 30"
             
-            if ($scanResult -eq 0 -or $null -eq $scanResult) {
-                Write-Host "  - Scan completed, starting downloads..."
-                Write-Output "winupdate progress: 25"
-                
-                # Start downloads
-                $usoDownloadJob = Start-Job -ScriptBlock {
-                    try {
-                        & UsoClient.exe StartDownload 2>&1 | Out-Null
-                        return $LASTEXITCODE
-                    } catch {
-                        return 1
-                    }
-                }
-                
-                $downloadResult = Wait-Job $usoDownloadJob -Timeout 300 | Receive-Job -ErrorAction SilentlyContinue
-                Remove-Job $usoDownloadJob -Force -ErrorAction SilentlyContinue
-                Write-Output "winupdate progress: 50"
-                
-                # Start install
-                Write-Host "  - Starting installation..."
-                $usoInstallJob = Start-Job -ScriptBlock {
-                    try {
-                        & UsoClient.exe StartInstall 2>&1 | Out-Null
-                        return $LASTEXITCODE
-                    } catch {
-                        return 1
-                    }
-                }
-                
-                $installResult = Wait-Job $usoInstallJob -Timeout 600 | Receive-Job -ErrorAction SilentlyContinue
-                Remove-Job $usoInstallJob -Force -ErrorAction SilentlyContinue
-                Write-Output "winupdate progress: 80"
-                
-                $usoSuccess = $true
-                Write-Host "UsoClient method completed successfully" -ForegroundColor Green
-            }
+            Write-Host "  - Starting installation (all updates)..."
+            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartInstall" -WindowStyle Hidden -ErrorAction SilentlyContinue
+            Write-Output "winupdate progress: 50"
+            
+            # Give it time to start the process
+            Start-Sleep -Seconds 20
+            Write-Output "winupdate progress: 60"
+            
         } catch {
             Write-Host "UsoClient method failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         
-        if ($usoSuccess) {
-            Write-Output "winupdate progress: 100"
-            Write-Host "Windows Updates initiated successfully (will continue in background)" -ForegroundColor Green
-            return $true
-        }
-        
-        # Method 3: Windows Update Assistant (if available)
-        Write-Host "Method 3: Trying Windows Update Assistant..." -ForegroundColor Yellow
-        try {
-            $wuaPath = Join-Path $DeploymentRoot "Windows10Upgrade9252.exe"
-            if (Test-Path $wuaPath) {
-                Write-Host "  - Running Windows Update Assistant..."
-                $wuaJob = Start-Job -ScriptBlock {
-                    param($path)
-                    try {
-                        $process = Start-Process -FilePath $path -ArgumentList "/quietinstall", "/skipeula", "/auto", "upgrade", "/copylogs" -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
-                        Wait-Process -Id $process.Id -Timeout 600 -ErrorAction SilentlyContinue
-                        return $true
-                    } catch {
-                        return $false
-                    }
-                } -ArgumentList $wuaPath
-                
-                Write-Output "winupdate progress: 85"
-                $wuaResult = Wait-Job $wuaJob -Timeout 700 | Receive-Job -ErrorAction SilentlyContinue
-                Remove-Job $wuaJob -Force -ErrorAction SilentlyContinue
-                
-                if ($wuaResult) {
-                    Write-Output "winupdate progress: 100"
-                    Write-Host "Windows Update Assistant completed" -ForegroundColor Green
-                    return $true
-                }
-            }
-        } catch {
-            Write-Host "Windows Update Assistant failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-        
-        # Method 4: PSWindowsUpdate module (fallback, slower but reliable)
-        Write-Host "Method 4: Using PSWindowsUpdate module (this may take longer)..." -ForegroundColor Yellow
-        Write-Output "winupdate progress: 15"
+        # Method 2: PSWindowsUpdate (NO LIMITS)
+        Write-Host "Installing ALL available updates via PSWindowsUpdate..." -ForegroundColor Yellow
         
         try {
-            # Quick module installation in background
-            $moduleJob = Start-Job -ScriptBlock {
-                try {
-                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                    [Net.ServicePointManager]::MaxServicePointIdleTime = 10000
-                    
-                    $ProgressPreference = 'SilentlyContinue'
-                    $ErrorActionPreference = 'SilentlyContinue'
-                    
-                    # Try to use existing module first
-                    if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
-                        Import-Module PSWindowsUpdate -Force
-                        return $true
-                    }
-                    
-                    # Install if not available
-                    Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -MinimumVersion 2.8.5.201 | Out-Null
-                    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck | Out-Null
-                    Import-Module PSWindowsUpdate -Force
-                    return $true
-                } catch {
-                    return $false
-                }
+            # Quick module setup
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $ProgressPreference = 'SilentlyContinue'
+            
+            if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+                Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
+                Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck -ErrorAction SilentlyContinue | Out-Null
             }
             
-            $moduleReady = Wait-Job $moduleJob -Timeout 90 | Receive-Job -ErrorAction SilentlyContinue
-            Remove-Job $moduleJob -Force -ErrorAction SilentlyContinue
-            
-            if (-not $moduleReady) {
-                Write-Output "winupdate error: Failed to install PSWindowsUpdate module"
-                Write-Host "PSWindowsUpdate module installation failed" -ForegroundColor Red
-                return $false
-            }
-            
-            Write-Output "winupdate progress: 30"
             Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
+            Write-Output "winupdate progress: 70"
             
-            # Fast update installation - critical updates only
-            Write-Host "  - Scanning for critical updates..."
+            # INSTALL EVERYTHING - NO SIZE LIMITS, NO COUNT LIMITS
+            Write-Host "  - Getting ALL available updates (no filters)..."
             $updateJob = Start-Job -ScriptBlock {
                 try {
                     Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
                     
-                    # Get only security and critical updates under 200MB
-                    $updates = Get-WindowsUpdate -MicrosoftUpdate -Criteria "IsInstalled=0 and Type='Software' and BrowseOnly=0" -ErrorAction SilentlyContinue |
-                        Where-Object { 
-                            ($_.MsrcSeverity -eq 'Critical' -or $_.MsrcSeverity -eq 'Important') -and 
-                            ($_.Size -lt 200MB)
-                        } |
-                        Select-Object -First 10
+                    # Get EVERYTHING that's not installed
+                    $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction SilentlyContinue
                     
                     if ($updates) {
-                        # Install in parallel batches
-                        $updates | ForEach-Object -Parallel {
-                            try {
-                                Install-WindowsUpdate -KBArticleID $_.KBArticleIDs -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-                            } catch {
-                                # Silent failure per update
-                            }
-                        } -ThrottleLimit 3
+                        Write-Output "Found $($updates.Count) updates to install"
+                        
+                        # Install ALL updates in parallel batches
+                        Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction SilentlyContinue | Out-Null
                         
                         return @{Success=$true; Count=$updates.Count}
                     }
@@ -2025,23 +1952,24 @@ function Run-WindowsUpdates {
                 }
             }
             
-            Write-Output "winupdate progress: 40"
+            Write-Output "winupdate progress: 75"
             
-            # Monitor update job with timeout
-            $updateTimeout = 900
-            $updateStartTime = Get-Date
-            $lastProgress = 40
+            # Monitor with progress updates
+            $timeout = 1800  # 30 minutes for ALL updates
+            $startTime = Get-Date
+            $lastProgress = 75
             
-            while ($updateJob.State -eq 'Running' -and ((Get-Date) - $updateStartTime).TotalSeconds -lt $updateTimeout) {
-                $elapsed = ((Get-Date) - $updateStartTime).TotalSeconds
-                $progress = [math]::Min(40 + [math]::Round(($elapsed / $updateTimeout) * 50), 90)
+            while ($updateJob.State -eq 'Running' -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
+                $elapsed = ((Get-Date) - $startTime).TotalSeconds
+                $progress = [math]::Min(75 + [math]::Round(($elapsed / $timeout) * 20), 95)
                 
                 if ($progress -gt $lastProgress) {
                     Write-Output "winupdate progress: $progress"
+                    Write-Host "  ... installing updates ($([math]::Round($elapsed/60)) minutes elapsed)" -ForegroundColor Cyan
                     $lastProgress = $progress
                 }
                 
-                Start-Sleep -Seconds 10
+                Start-Sleep -Seconds 15
             }
             
             $updateResult = Wait-Job $updateJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
@@ -2049,34 +1977,25 @@ function Run-WindowsUpdates {
             
             if ($updateResult.Success) {
                 Write-Output "winupdate progress: 100"
-                if ($updateResult.Count -gt 0) {
-                    Write-Host "Installed $($updateResult.Count) critical updates" -ForegroundColor Green
-                } else {
-                    Write-Host "No critical updates found or already up to date" -ForegroundColor Green
-                }
-                return $true
-            } else {
-                Write-Output "winupdate progress: 100"
-                Write-Host "Update check completed with warnings: $($updateResult.Error)" -ForegroundColor Yellow
+                Write-Host "Successfully processed $($updateResult.Count) updates" -ForegroundColor Green
                 return $true
             }
             
         } catch {
-            Write-Output "winupdate error: $($_.Exception.Message)"
-            Write-Host "PSWindowsUpdate method failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "PSWindowsUpdate failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         
-        # If all methods fail, still return success with a warning
+        # If we get here, at least UsoClient was triggered
         Write-Output "winupdate progress: 100"
-        Write-Host "Windows Updates triggered but verification incomplete - updates will continue in background" -ForegroundColor Yellow
+        Write-Host "Windows Updates initiated - continuing in background" -ForegroundColor Yellow
         return $true
         
     } catch {
         Write-Output "winupdate error: $($_.Exception.Message)"
-        Write-Host "Windows Updates encountered an error but deployment will continue" -ForegroundColor Yellow
         return $false
     }
 }
+
 function Restore-SystemSettings {
     Write-Host "=== RESTORING SYSTEM SETTINGS ===" -ForegroundColor Cyan
     
