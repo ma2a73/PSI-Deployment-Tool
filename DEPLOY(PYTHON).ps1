@@ -1103,13 +1103,9 @@ function Install-Vantage {
             } catch {
                 Write-Host "  ✗ $($msi.Name) failed: $($_.Exception.Message)" -ForegroundColor Red
             }
-            
-            # Small delay between installations
-            Start-Sleep -Seconds 2
-        } else {
-            Write-Host "  ✗ $($msi.Name) not found at $($msi.Path)" -ForegroundColor Red
-        }
-    }
+        } 
+    } 
+
     
     $installTime = (Get-Date) - $installStartTime
     Write-Host "MSI installations completed in $($installTime.ToString('mm\:ss'))" -ForegroundColor Green
@@ -1932,7 +1928,7 @@ function Run-WindowsUpdates {
                 
                 if ($progress -gt $lastProgress) {
                     Write-Output "winupdate progress: $progress"
-                    Write-Host "  ... installing updates ($([math]::Round($elapsed/60)) minutes elapsed)" -ForegroundColor Cyan
+                    Write-Host ("  ... installing updates ({0} minutes elapsed)" -f ([math]::Round($elapsed / 60))) -ForegroundColor Cyan
                     $lastProgress = $progress
                 }
                 
