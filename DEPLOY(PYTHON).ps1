@@ -817,7 +817,7 @@ function Install-Vantage {
         }
     }
 
-    # First check deployment cache
+    # First check deployment cache (downloaded via Python from IIS)
     $localZip = Join-Path $DeploymentRoot "client803.zip"
     $useLocalCache = $false
     
@@ -828,6 +828,7 @@ function Install-Vantage {
     } else {
         Write-Host "client803.zip not found in cache, using network paths" -ForegroundColor Yellow
         
+        # Fallback to network paths
         switch ($location.ToUpper()) {
             "GEORGIA" { 
                 $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
@@ -865,10 +866,12 @@ function Install-Vantage {
         
         try {
             if ($useLocalCache) {
+                # Already in cache, use directly
                 $tempZip = $localZip
                 Write-Host "Using cached archive directly" -ForegroundColor Green
                 Write-Output "vantage progress: 50"
             } else {
+                # Copy from network
                 $tempZip = "$env:TEMP\client803_install.zip"
                 
                 Write-Host "Copying compressed archive from network..."
@@ -917,6 +920,7 @@ function Install-Vantage {
                 Add-Type -AssemblyName System.IO.Compression.FileSystem
                 [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $targetPath)
                 
+                # Clean up temp file if we copied from network
                 if (-not $useLocalCache) {
                     Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
                 }
@@ -1065,87 +1069,50 @@ function Install-Vantage {
         Write-Host ".NET Framework installer not found: $dotnetPath" -ForegroundColor Yellow
     }
     
-    # ===== ULTRA-FAST MSI INSTALLATION USING CMD (HIDDEN WINDOWS) =====
-    Write-Host "Installing Vantage MSI dependencies via CMD (hidden, fast mode)..." -ForegroundColor Cyan
+    # ===== SEQUENTIAL MSI INSTALLATION (WINDOWS REQUIREMENT) =====
+    Write-Host "Installing Vantage MSI dependencies (sequential - Windows requirement)..." -ForegroundColor Cyan
     
-    # Create a temporary batch file for parallel execution
-    $batchFile = "$env:TEMP\vantage_install_msi.bat"
-    $batchContent = @"
-@echo off
-REM Parallel MSI installation - all run simultaneously
-
-START /MIN "WSE" msiexec.exe /i "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi" /qb! /norestart REBOOT=ReallySuppress
-START /MIN "Crystal" msiexec.exe /i "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi" /qb! /norestart REBOOT=ReallySuppress
-START /MIN "SQLNative" msiexec.exe /i "$DeploymentRoot\sqlncli.msi" /qb! /norestart REBOOT=ReallySuppress
-
-REM Wait for all to complete
-:WAIT
-timeout /t 5 /nobreak >nul
-tasklist /FI "WINDOWTITLE eq WSE" 2>nul | find /I "msiexec.exe" >nul
-if not errorlevel 1 goto WAIT
-tasklist /FI "WINDOWTITLE eq Crystal" 2>nul | find /I "msiexec.exe" >nul
-if not errorlevel 1 goto WAIT
-tasklist /FI "WINDOWTITLE eq SQLNative" 2>nul | find /I "msiexec.exe" >nul
-if not errorlevel 1 goto WAIT
-
-echo MSI_INSTALLATIONS_COMPLETE
-exit /b 0
-"@
+    $msiFiles = @(
+        @{Path = "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi"; Name = "Microsoft WSE 3.0"; Args = @("/i", "`"$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi`"", "/qb!", "/norestart", "REBOOT=ReallySuppress")},
+        @{Path = "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi"; Name = "Crystal Reports"; Args = @("/i", "`"$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi`"", "/qb!", "/norestart", "REBOOT=ReallySuppress")},
+        @{Path = "$DeploymentRoot\sqlncli.msi"; Name = "SQL Native Client"; Args = @("/i", "`"$DeploymentRoot\sqlncli.msi`"", "/qb!", "/norestart", "REBOOT=ReallySuppress", "IACCEPTSQLNCLILICENSETERMS=YES")}
+    )
     
-    try {
-        # Write batch file
-        Set-Content -Path $batchFile -Value $batchContent -Force -ErrorAction Stop
-        Write-Host "  - Created batch installer: $batchFile" -ForegroundColor Yellow
-        
-        # Execute using WScript for completely hidden execution
-        $vbsFile = "$env:TEMP\vantage_install_silent.vbs"
-        $vbsContent = @"
-Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "cmd.exe /c ""$batchFile""", 0, True
-"@
-        Set-Content -Path $vbsFile -Value $vbsContent -Force -ErrorAction Stop
-        
-        Write-Host "  - Starting hidden CMD installation (3 MSIs in parallel)..." -ForegroundColor Yellow
-        Write-Output "vantage progress: 88"
-        
-        # Run the VBS script which will run CMD completely hidden
-        $vbsProcess = Start-Process -FilePath "wscript.exe" -ArgumentList "`"$vbsFile`"" -PassThru -WindowStyle Hidden -Wait
-        
-        Write-Host "  - MSI installations completed" -ForegroundColor Green
-        Write-Output "vantage progress: 97"
-        
-        # Cleanup
-        Remove-Item $batchFile -Force -ErrorAction SilentlyContinue
-        Remove-Item $vbsFile -Force -ErrorAction SilentlyContinue
-        
-    } catch {
-        Write-Host "  - CMD batch installation failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "  - Falling back to direct PowerShell installation..." -ForegroundColor Yellow
-        
-        # Fallback: Direct msiexec calls (still hidden)
-        $msiPaths = @(
-            "$DeploymentRoot\Microsoft WSE 3.0 Runtime.msi",
-            "$DeploymentRoot\Crystal Reports XI R2 .Net 3.0 Runtime SP5.msi",
-            "$DeploymentRoot\sqlncli.msi"
-        )
-        
-        $processes = @()
-        foreach ($msiPath in $msiPaths) {
-            if (Test-Path $msiPath) {
-                $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "`"$msiPath`"", "/qb!", "/norestart", "REBOOT=ReallySuppress" -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
-                $processes += $proc
+    $installStartTime = Get-Date
+    $msiCount = 0
+    
+    foreach ($msi in $msiFiles) {
+        if (Test-Path $msi.Path) {
+            Write-Host "  Installing: $($msi.Name)..." -ForegroundColor Yellow
+            
+            try {
+                $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msi.Args -PassThru -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+                
+                if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+                    Write-Host "  ✓ $($msi.Name) installed successfully (exit code: $($proc.ExitCode))" -ForegroundColor Green
+                } elseif ($proc.ExitCode -eq 1605) {
+                    Write-Host "  ⚠ $($msi.Name) may already be installed (exit code: 1605)" -ForegroundColor Yellow
+                } else {
+                    Write-Host "  ⚠ $($msi.Name) completed with exit code: $($proc.ExitCode)" -ForegroundColor Yellow
+                }
+                
+                $msiCount++
+                $progress = 87 + [math]::Min([math]::Round(($msiCount / $msiFiles.Count) * 10), 10)
+                Write-Output "vantage progress: $progress"
+                
+            } catch {
+                Write-Host "  ✗ $($msi.Name) failed: $($_.Exception.Message)" -ForegroundColor Red
             }
+            
+            # Small delay between installations
+            Start-Sleep -Seconds 2
+        } else {
+            Write-Host "  ✗ $($msi.Name) not found at $($msi.Path)" -ForegroundColor Red
         }
-        
-        # Wait for all processes
-        if ($processes.Count -gt 0) {
-            Write-Host "  - Waiting for $($processes.Count) MSI installers..." -ForegroundColor Yellow
-            $processes | Wait-Process -Timeout 300 -ErrorAction SilentlyContinue
-            Write-Host "  - MSI installations completed" -ForegroundColor Green
-        }
-        
-        Write-Output "vantage progress: 97"
     }
+    
+    $installTime = (Get-Date) - $installStartTime
+    Write-Host "MSI installations completed in $($installTime.ToString('mm\:ss'))" -ForegroundColor Green
 
     # Wait for .NET Framework background job to complete (if it was started)
     if ($dotnetJob) {
