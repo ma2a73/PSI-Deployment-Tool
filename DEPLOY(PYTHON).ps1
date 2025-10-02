@@ -813,6 +813,9 @@ function Install-Vantage {
         if ($existingFiles -gt 1000) {
             Write-Host "Vantage appears to already be installed. Skipping installation."
             Write-Output "vantage progress: 100"
+            
+            # Still configure session management even if already installed
+            Install-VantageSessionManager
             return
         }
     }
@@ -866,12 +869,10 @@ function Install-Vantage {
         
         try {
             if ($useLocalCache) {
-                # Already in cache, use directly
                 $tempZip = $localZip
                 Write-Host "Using cached archive directly" -ForegroundColor Green
                 Write-Output "vantage progress: 50"
             } else {
-                # Copy from network
                 $tempZip = "$env:TEMP\client803_install.zip"
                 
                 Write-Host "Copying compressed archive from network..."
@@ -920,7 +921,6 @@ function Install-Vantage {
                 Add-Type -AssemblyName System.IO.Compression.FileSystem
                 [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $targetPath)
                 
-                # Clean up temp file if we copied from network
                 if (-not $useLocalCache) {
                     Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
                 }
@@ -1134,8 +1134,103 @@ function Install-Vantage {
         Write-Host "Desktop shortcut not found: $remoteShortcut" -ForegroundColor Yellow
     }
 
+    # ===== CONFIGURE VANTAGE SESSION AUTO-TERMINATION =====
+    Install-VantageSessionManager
+
     Write-Output "vantage progress: 100"
     Write-Host "Vantage installation completed successfully" -ForegroundColor Green
+}
+
+function Install-VantageSessionManager {
+    Write-Host "=== CONFIGURING VANTAGE SESSION AUTO-TERMINATION ===" -ForegroundColor Cyan
+    
+    try {
+        # Create the session management script
+        $sessionScript = @'
+$targetPort = 8301
+$processName = "MfgSys" 
+$scriptToRun = "C:\vantagesession.ps1"
+
+while ($true) {
+    # Wait for MfgSys to start
+    while (-not (Get-Process -Name $processName -ErrorAction SilentlyContinue)) {
+        Start-Sleep -Seconds 2
+    }
+
+    # Wait for MfgSys to close
+    while (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+        Start-Sleep -Seconds 2
+    }
+
+    # Terminate orphaned sessions on port 8301
+    $connections = Get-NetTCPConnection -RemotePort $targetPort -ErrorAction SilentlyContinue
+    if ($connections) {
+        foreach ($conn in $connections) {
+            $pid = $conn.OwningProcess
+            try {
+                $proc = Get-Process -Id $pid -ErrorAction Stop
+                Stop-Process -Id $pid -Force
+                Write-Host "Terminated orphaned Vantage session (PID: $pid)" -ForegroundColor Yellow
+            } catch {
+                Write-Warning "Could not terminate process with PID $pid"
+            }
+        }
+    }
+
+    # Restart monitoring
+    Start-Sleep -Seconds 2
+}
+'@
+        
+        # Save the PowerShell script
+        $scriptPath = "C:\vantagesession.ps1"
+        $sessionScript | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+        Write-Host "Session management script created: $scriptPath" -ForegroundColor Green
+        
+        # Create the VBScript wrapper for silent execution
+        $vbsScript = @'
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\vantagesession.ps1""", 0, False
+Set objShell = Nothing
+'@
+        
+        $vbsPath = "C:\hidden2.vbs"
+        $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII -Force
+        Write-Host "VBScript wrapper created: $vbsPath" -ForegroundColor Green
+        
+        # Create scheduled task to run at startup
+        $taskName = "VantageSessionManager"
+        
+        # Remove existing task if present
+        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "Removed existing session manager task" -ForegroundColor Yellow
+        }
+        
+        # Create new scheduled task
+        $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`"" -WorkingDirectory "C:\"
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        
+        Write-Host "Vantage Session Manager scheduled task created successfully" -ForegroundColor Green
+        Write-Host "  - Task will run at system startup" -ForegroundColor Cyan
+        Write-Host "  - Monitors for orphaned Vantage sessions on port 8301" -ForegroundColor Cyan
+        Write-Host "  - Automatically terminates sessions when MfgSys.exe closes" -ForegroundColor Cyan
+        
+        # Start the task immediately
+        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Write-Host "Session manager started and running in background" -ForegroundColor Green
+        
+        return $true
+        
+    } catch {
+        Write-Host "Failed to configure Vantage session manager: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
 }
 
 function Remove-Office365 {
@@ -1756,8 +1851,20 @@ function Install-VPNProfile {
     $vpnProfile = Join-Path $DeploymentRoot "PSI-PAC VPN.vpn"
     if (Test-Path $vpnProfile) {
         try {
-            Start-Process -FilePath $vpnProfile -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Write-Host "VPN profile imported successfully."
+            Write-Host "Starting VPN profile import (will auto-close in 6 seconds)..."
+            $vpnProcess = Start-Process -FilePath $vpnProfile -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+            
+            # Wait 6 seconds for the import to complete
+            Start-Sleep -Seconds 6
+            
+            # Terminate the process if it's still running
+            if ($vpnProcess -and -not $vpnProcess.HasExited) {
+                Stop-Process -Id $vpnProcess.Id -Force -ErrorAction SilentlyContinue
+                Write-Host "VPN profile import completed and process terminated."
+            } else {
+                Write-Host "VPN profile import completed (process already closed)."
+            }
+            
             return $true
         } catch {
             Write-Host "Failed to import VPN profile: $_"
