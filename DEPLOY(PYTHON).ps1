@@ -1136,9 +1136,326 @@ function Install-Vantage {
 
     # ===== CONFIGURE VANTAGE SESSION AUTO-TERMINATION =====
     Install-VantageSessionManager
+    
+    # ===== CONFIGURE ADDITIONAL SESSION PREVENTION MEASURES =====
+    Configure-VantageRegistry
+    Create-VantageCleanupShortcut
 
     Write-Output "vantage progress: 100"
     Write-Host "Vantage installation completed successfully" -ForegroundColor Green
+}
+
+function Install-VantageSessionManager {
+    Write-Host "=== CONFIGURING VANTAGE SESSION AUTO-TERMINATION ===" -ForegroundColor Cyan
+    
+    try {
+        # Create the session management script
+        $sessionScript = @'
+$targetPort = 8301
+$processName = "MfgSys"
+$logPath = "C:\Logs\VantageSessionManager.log"
+
+# Create log directory if it doesn't exist
+$logDir = Split-Path $logPath -Parent
+if (-not (Test-Path $logDir)) {
+    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+}
+
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8
+}
+
+function Clear-OrphanedSessions {
+    # Method 1: Kill orphaned TCP connections on port 8301
+    $connections = Get-NetTCPConnection -RemotePort $targetPort -ErrorAction SilentlyContinue
+    if ($connections) {
+        foreach ($conn in $connections) {
+            $pid = $conn.OwningProcess
+            try {
+                $proc = Get-Process -Id $pid -ErrorAction Stop
+                $processName = $proc.ProcessName
+                Stop-Process -Id $pid -Force -ErrorAction Stop
+                Write-Log "Terminated orphaned connection: $processName (PID: $pid) on port $targetPort"
+            } catch {
+                Write-Log "Warning: Could not terminate PID $pid - $($_.Exception.Message)"
+            }
+        }
+    }
+    
+    # Method 2: Kill any lingering Vantage-related processes
+    $vantageProcesses = @("MfgSys", "Epicor", "VantageClient", "Progress", "prowin32")
+    foreach ($procName in $vantageProcesses) {
+        $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        if ($procs) {
+            foreach ($proc in $procs) {
+                try {
+                    Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                    Write-Log "Terminated lingering process: $procName (PID: $($proc.Id))"
+                } catch {
+                    Write-Log "Warning: Could not terminate $procName - $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+    
+    # Method 3: Clear Vantage temporary/lock files
+    $vantageTemp = "C:\client803\temp"
+    if (Test-Path $vantageTemp) {
+        Get-ChildItem -Path $vantageTemp -Filter "*.lck" -ErrorAction SilentlyContinue | 
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $vantageTemp -Filter "*.tmp" -ErrorAction SilentlyContinue | 
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Log "Cleaned up lock and temp files from $vantageTemp"
+    }
+    
+    # Method 4: Reset netsh if connections are stuck
+    try {
+        & netsh int ip reset | Out-Null
+        Write-Log "Reset TCP/IP stack"
+    } catch {
+        Write-Log "Could not reset TCP/IP stack"
+    }
+}
+
+Write-Log "=== Vantage Session Manager Started ==="
+
+while ($true) {
+    # Wait for MfgSys to start
+    while (-not (Get-Process -Name $processName -ErrorAction SilentlyContinue)) {
+        Start-Sleep -Seconds 2
+    }
+    
+    Write-Log "MfgSys.exe started - monitoring session"
+
+    # Wait for MfgSys to close
+    while (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+        Start-Sleep -Seconds 2
+    }
+    
+    Write-Log "MfgSys.exe closed - cleaning up orphaned sessions"
+    
+    # Wait a moment for graceful shutdown
+    Start-Sleep -Seconds 3
+    
+    # Clean up all orphaned sessions
+    Clear-OrphanedSessions
+    
+    Write-Log "Session cleanup completed - resuming monitoring"
+    Start-Sleep -Seconds 2
+}
+'@
+        
+        # Save the PowerShell script
+        $scriptPath = "C:\vantagesession.ps1"
+        $sessionScript | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+        Write-Host "Session management script created: $scriptPath" -ForegroundColor Green
+        
+        # Create the VBScript wrapper for silent execution
+        $vbsScript = @'
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\vantagesession.ps1""", 0, False
+Set objShell = Nothing
+'@
+        
+        $vbsPath = "C:\hidden2.vbs"
+        $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII -Force
+        Write-Host "VBScript wrapper created: $vbsPath" -ForegroundColor Green
+        
+        # Create scheduled task to run at startup
+        $taskName = "VantageSessionManager"
+        
+        # Remove existing task if present
+        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "Removed existing session manager task" -ForegroundColor Yellow
+        }
+        
+        # Create new scheduled task
+        $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`"" -WorkingDirectory "C:\"
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        
+        Write-Host "Vantage Session Manager scheduled task created successfully" -ForegroundColor Green
+        Write-Host "  - Task will run at system startup" -ForegroundColor Cyan
+        Write-Host "  - Monitors for orphaned Vantage sessions on port 8301" -ForegroundColor Cyan
+        Write-Host "  - Automatically terminates sessions when MfgSys.exe closes" -ForegroundColor Cyan
+        
+        # Start the task immediately
+        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Write-Host "Session manager started and running in background" -ForegroundColor Green
+        
+        return $true
+        
+    } catch {
+        Write-Host "Failed to configure Vantage session manager: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Configure-VantageRegistry {
+    Write-Host "=== CONFIGURING VANTAGE REGISTRY SETTINGS ===" -ForegroundColor Cyan
+    
+    try {
+        # Registry path for Vantage settings
+        $vantageRegPath = "HKLM:\SOFTWARE\Epicor\Vantage"
+        
+        if (-not (Test-Path $vantageRegPath)) {
+            New-Item -Path $vantageRegPath -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        
+        # Disable session locking/caching that can cause the "one session" issue
+        Set-ItemProperty -Path $vantageRegPath -Name "DisableSessionCache" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $vantageRegPath -Name "ForceSessionCleanup" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $vantageRegPath -Name "SessionTimeout" -Value 300 -Type DWord -ErrorAction SilentlyContinue
+        
+        Write-Host "Vantage registry settings configured" -ForegroundColor Green
+        
+        # Configure TCP/IP settings to prevent stuck connections
+        $tcpRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+        Set-ItemProperty -Path $tcpRegPath -Name "TcpTimedWaitDelay" -Value 30 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $tcpRegPath -Name "KeepAliveTime" -Value 300000 -Type DWord -ErrorAction SilentlyContinue
+        
+        Write-Host "TCP/IP settings optimized for Vantage" -ForegroundColor Green
+        
+        return $true
+        
+    } catch {
+        Write-Host "Failed to configure Vantage registry settings: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function Create-VantageCleanupShortcut {
+    Write-Host "=== CREATING MANUAL VANTAGE SESSION CLEANUP SHORTCUT ===" -ForegroundColor Cyan
+    
+    try {
+        # Create a manual cleanup script for users
+        $manualCleanupScript = @'
+# Manual Vantage Session Cleanup Script
+Write-Host "=== VANTAGE SESSION CLEANUP UTILITY ===" -ForegroundColor Cyan
+Write-Host "This will forcefully terminate all Vantage sessions and cleanup locks" -ForegroundColor Yellow
+Write-Host ""
+
+$confirmation = Read-Host "Continue? (Y/N)"
+if ($confirmation -ne 'Y' -and $confirmation -ne 'y') {
+    Write-Host "Cancelled by user" -ForegroundColor Red
+    Start-Sleep -Seconds 2
+    exit
+}
+
+Write-Host "`nStep 1: Killing Vantage processes..." -ForegroundColor Yellow
+$vantageProcesses = @("MfgSys", "Epicor", "VantageClient", "Progress", "prowin32")
+$killedCount = 0
+
+foreach ($procName in $vantageProcesses) {
+    $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+    if ($procs) {
+        foreach ($proc in $procs) {
+            try {
+                Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                Write-Host "  Killed: $procName (PID: $($proc.Id))" -ForegroundColor Green
+                $killedCount++
+            } catch {
+                Write-Host "  Failed to kill: $procName (PID: $($proc.Id))" -ForegroundColor Red
+            }
+        }
+    }
+}
+
+if ($killedCount -eq 0) {
+    Write-Host "  No Vantage processes found running" -ForegroundColor Cyan
+}
+
+Write-Host "`nStep 2: Clearing orphaned connections on port 8301..." -ForegroundColor Yellow
+$connections = Get-NetTCPConnection -RemotePort 8301 -ErrorAction SilentlyContinue
+$connKilled = 0
+
+if ($connections) {
+    foreach ($conn in $connections) {
+        $pid = $conn.OwningProcess
+        try {
+            Stop-Process -Id $pid -Force -ErrorAction Stop
+            Write-Host "  Killed connection: PID $pid" -ForegroundColor Green
+            $connKilled++
+        } catch {
+            Write-Host "  Failed to kill: PID $pid" -ForegroundColor Red
+        }
+    }
+} else {
+    Write-Host "  No orphaned connections found" -ForegroundColor Cyan
+}
+
+Write-Host "`nStep 3: Cleaning lock files..." -ForegroundColor Yellow
+$lockFiles = @(
+    "C:\client803\temp\*.lck",
+    "C:\client803\temp\*.tmp",
+    "C:\client803\*.lck"
+)
+
+$filesDeleted = 0
+foreach ($pattern in $lockFiles) {
+    $files = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue
+    foreach ($file in $files) {
+        try {
+            Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+            Write-Host "  Deleted: $($file.Name)" -ForegroundColor Green
+            $filesDeleted++
+        } catch {
+            Write-Host "  Failed to delete: $($file.Name)" -ForegroundColor Red
+        }
+    }
+}
+
+if ($filesDeleted -eq 0) {
+    Write-Host "  No lock files found" -ForegroundColor Cyan
+}
+
+Write-Host "`nStep 4: Flushing DNS and resetting network..." -ForegroundColor Yellow
+try {
+    ipconfig /flushdns | Out-Null
+    Write-Host "  DNS cache flushed" -ForegroundColor Green
+} catch {
+    Write-Host "  Failed to flush DNS" -ForegroundColor Red
+}
+
+Write-Host "`n=== CLEANUP COMPLETE ===" -ForegroundColor Green
+Write-Host "Processes killed: $killedCount" -ForegroundColor Cyan
+Write-Host "Connections terminated: $connKilled" -ForegroundColor Cyan
+Write-Host "Lock files deleted: $filesDeleted" -ForegroundColor Cyan
+Write-Host "`nYou can now try launching Vantage again." -ForegroundColor Yellow
+Write-Host ""
+Read-Host "Press Enter to exit"
+'@
+        
+        $cleanupScriptPath = "C:\VantageSessionCleanup.ps1"
+        $manualCleanupScript | Out-File -FilePath $cleanupScriptPath -Encoding UTF8 -Force
+        
+        # Create desktop shortcut for the cleanup script
+        $WshShell = New-Object -ComObject WScript.Shell
+        $shortcutPath = "$env:PUBLIC\Desktop\Fix Vantage Sessions.lnk"
+        $shortcut = $WshShell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = "powershell.exe"
+        $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$cleanupScriptPath`""
+        $shortcut.WorkingDirectory = "C:\"
+        $shortcut.Description = "Manually cleanup stuck Vantage sessions"
+        $shortcut.IconLocation = "C:\Windows\System32\shell32.dll,146"
+        $shortcut.Save()
+        
+        Write-Host "Manual cleanup shortcut created on desktop" -ForegroundColor Green
+        Write-Host "  Users can double-click 'Fix Vantage Sessions' if issues occur" -ForegroundColor Cyan
+        
+        return $true
+        
+    } catch {
+        Write-Host "Failed to create cleanup shortcut: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
 }
 
 function Install-VantageSessionManager {
