@@ -1,4 +1,3 @@
-
 #region PSI Electron App Integration Hooks
 
 # The following hooks ensure full compatibility with the Electron + React frontend integration
@@ -16,11 +15,6 @@ function Write-DeploymentProgress {
     } else {
         Write-Host "$timestamp [$Level] $Message"
     }
-}
-
-# Compatibility alias for PSI-WriteLog → Write-DeploymentProgress bridge
-if (-not (Get-Command Write-DeploymentProgress -ErrorAction SilentlyContinue)) {
-    function Write-DeploymentProgress { param($Message,$Progress); Write-Host $Message }
 }
 
 # Ensure all PSI-WriteLog calls emit visible logs for Electron parsing
@@ -53,9 +47,8 @@ PSI-EmitProgress 15 "System optimization initialized"
 
 #region PSI Fast Path + McAfee Auto-Removal (No Reboot)
 # --- Safe speed-ups (scoped to this process) ---
-$ProgressPreference = 'SilentlyContinue'     # skip chatty progress bars that slow down loops
-$PSStyle.OutputRendering = 'PlainText' 2>$null  # avoid VT rendering overhead if supported (PS 7+ safe no-op on 5.1)
-$ErrorActionPreference = 'Stop'          # fail fast
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
 
 # Lightweight logger that defers to Write-DeploymentProgress if present
 function PSI-Log {
@@ -70,20 +63,15 @@ function PSI-Log {
 function Remove-McAfee {
     <#
         .SYNOPSIS
-            Silently removes McAfee (Agent, ENS, LiveSafe, Security Scan, legacy) without reboot.
-        .NOTES
-            - Tries McAfee Agent "frminst.exe /forceuninstall"
-            - Iterates 32/64-bit Uninstall keys; normalizes UninstallString to quiet, no-restart
-            - Stops/Disables services & scheduled tasks pre-uninstall
-            - Best-effort cleanup of residual folders
+            Silently removes McAfee without reboot - ENCODING-SAFE VERSION
     #>
     [CmdletBinding()]
     param()
 
     $found = $false
-    PSI-Log "🔍 Checking for McAfee products..."
+    PSI-Log "Checking for McAfee products..."
 
-    # 1) Try McAfee Agent forced uninstall first (common in enterprise)
+    # 1) Try McAfee Agent forced uninstall first
     $agentPaths = @(
         "$Env:ProgramFiles\McAfee\Agent\x86\frminst.exe",
         "$Env:ProgramFiles\McAfee\Agent\frminst.exe",
@@ -94,17 +82,17 @@ function Remove-McAfee {
     foreach ($p in $agentPaths) {
         try {
             $found = $true
-            PSI-Log "🧹 McAfee Agent detected -> $p (forcing uninstall, no restart)"
+            PSI-Log "McAfee Agent detected -> $p (forcing uninstall)"
             $proc = Start-Process -FilePath $p -ArgumentList "/forceuninstall" -PassThru -WindowStyle Hidden -Wait
             PSI-Log "   frminst exit code: $($proc.ExitCode)"
         } catch {
-            PSI-Log "   ⚠️ frminst failed: $($_.Exception.Message)"
+            PSI-Log "   Warning: frminst failed: $($_.Exception.Message)"
         }
     }
 
-    # 2) Stop/disable McAfee services & tasks (best effort)
+    # 2) Stop/disable McAfee services & tasks
     try {
-        $svc = Get-Service | Where-Object { $_.Name -match '^(mf|mfe|mcafee)' -or $_.DisplayName -match 'McAfee' }
+        $svc = Get-Service | Where-Object { $_.Name -like '*mcafee*' -or $_.Name -like 'mf*' -or $_.DisplayName -like '*McAfee*' }
         foreach ($s in $svc) {
             try {
                 if ($s.Status -ne 'Stopped') { Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue }
@@ -114,13 +102,13 @@ function Remove-McAfee {
     } catch {}
 
     try {
-        $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'McAfee' -or $_.TaskPath -match 'McAfee' }
+        $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like '*McAfee*' }
         foreach ($t in $tasks) {
             try { Disable-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
         }
     } catch {}
 
-    # 3) Uninstall via registry uninstall strings (32/64)
+    # 3) Uninstall via registry (ENCODING-SAFE - NO COMPLEX REGEX)
     $uninstallRoots = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
@@ -130,7 +118,9 @@ function Remove-McAfee {
         Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
             try {
                 $disp = (Get-ItemProperty $_.PSPath -ErrorAction Stop).DisplayName
-                if ($disp -and ($disp -match 'McAfee|Security Scan|LiveSafe|Endpoint Security|VirusScan|DLP|Agent')) { $_ }
+                if ($disp -and ($disp -like '*McAfee*' -or $disp -like '*Security Scan*' -or $disp -like '*LiveSafe*' -or $disp -like '*Endpoint Security*' -or $disp -like '*VirusScan*')) {
+                    $_
+                }
             } catch {}
         }
     }
@@ -143,50 +133,69 @@ function Remove-McAfee {
             if (-not $us) { continue }
             $found = $true
 
-            PSI-Log "🧨 Uninstalling: $name"
+            PSI-Log "Uninstalling: $name"
 
-            # Normalize UninstallString -> quiet + no restart
-            $exe, $args = $null, $null
-            if ($us -match '^"?(?<exe>[^"]+?\.msi)"?\s*(?<rest>.*)$' -or $us -match 'msiexec\.exe') {
-                # MSI-based
-                # Ensure we end up with: msiexec /x {GUID or MSI} /qn REBOOT=ReallySuppress /norestart
-                if ($us -match '/x\s*({[^}]+}|".+?")') {
-                    $exe = "msiexec.exe"
-                    $args = "$us"
-                } elseif ($us -match '\.msi') {
-                    $exe = "msiexec.exe"
-                    $args = '/i "' + ($us -replace '.*?"([^"]+\.msi)".*', '$1') + '" /qn REBOOT=ReallySuppress /norestart'
+            # Normalize UninstallString (SIMPLIFIED - NO PROBLEMATIC REGEX)
+            $exe = $null
+            $args = $null
+            
+            # Check if MSI-based
+            if ($us -like '*msiexec*' -or $us -like '*.msi*') {
+                $exe = "msiexec.exe"
+                
+                # Try to extract GUID using simple string operations
+                $guidStart = $us.IndexOf('{')
+                $guidEnd = $us.IndexOf('}')
+                
+                if ($guidStart -ge 0 -and $guidEnd -gt $guidStart) {
+                    $guid = $us.Substring($guidStart, ($guidEnd - $guidStart + 1))
+                    $args = "/x `"$guid`" /qn REBOOT=ReallySuppress /norestart"
+                } elseif ($us -like '*.msi*') {
+                    # Try to extract MSI path
+                    $msiStart = $us.IndexOf('.msi')
+                    if ($msiStart -gt 0) {
+                        # Find start of path (look backwards for quote or space)
+                        $pathStart = $us.LastIndexOf('"', $msiStart)
+                        if ($pathStart -lt 0) { $pathStart = $us.LastIndexOf(' ', $msiStart) }
+                        if ($pathStart -lt 0) { $pathStart = 0 }
+                        
+                        $msiPath = $us.Substring($pathStart, $msiStart - $pathStart + 4).Trim('"', ' ')
+                        $args = "/x `"$msiPath`" /qn REBOOT=ReallySuppress /norestart"
+                    } else {
+                        $args = "/x $us /qn REBOOT=ReallySuppress /norestart"
+                    }
                 } else {
-                    $exe = "msiexec.exe"
                     $args = "/x $us /qn REBOOT=ReallySuppress /norestart"
                 }
-                # Normalize spacing
-                $args = $args -replace '/qn', '/qn' -replace '/quiet', '/qn'
-                if ($args -notmatch 'REBOOT=ReallySuppress') { $args += ' REBOOT=ReallySuppress' }
-                if ($args -notmatch '/norestart') { $args += ' /norestart' }
             } else {
                 # EXE-based
                 if ($us.StartsWith('"')) {
-                    $exe = ($us -split '"')[1]
-                    $args = $us.Substring($exe.Length + 2).Trim()
+                    $parts = $us.Split('"')
+                    $exe = $parts[1]
+                    $args = if ($parts.Length -gt 2) { $parts[2..($parts.Length-1)] -join ' ' } else { "" }
                 } else {
                     $parts = $us.Split(' ', 2)
                     $exe = $parts[0]
-                    $args = ($parts | Select-Object -Skip 1) -join ' '
+                    $args = if ($parts.Length -gt 1) { $parts[1] } else { "" }
                 }
-                # Add quiet + no restart if missing
-                if ($args -notmatch '/qn|/quiet|/s|/silent') { $args += ' /quiet' }
-                if ($args -notmatch '/norestart|REBOOT=ReallySuppress') { $args += ' /norestart' }
+                
+                # Add quiet flags if missing
+                if ($args -notlike '*quiet*' -and $args -notlike '*/q*' -and $args -notlike '*/s*') {
+                    $args += ' /quiet'
+                }
+                if ($args -notlike '*norestart*') {
+                    $args += ' /norestart'
+                }
             }
 
             $proc = Start-Process -FilePath $exe -ArgumentList $args -PassThru -WindowStyle Hidden -Wait
             PSI-Log "   Exit code: $($proc.ExitCode)"
         } catch {
-            PSI-Log "   ⚠️ Failed to uninstall via registry for key $($k.PSChildName): $($_.Exception.Message)"
+            PSI-Log "   Warning: Failed to uninstall: $($_.Exception.Message)"
         }
     }
 
-    # 4) Residual cleanup (best effort)
+    # 4) Residual cleanup
     $paths = @(
         "$Env:ProgramFiles\McAfee",
         "${Env:ProgramFiles(x86)}\McAfee",
@@ -195,29 +204,29 @@ function Remove-McAfee {
     foreach ($p in $paths) {
         try {
             if (Test-Path $p) {
-                PSI-Log "🧽 Cleaning up: $p"
+                PSI-Log "Cleaning up: $p"
                 Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
             }
         } catch {}
     }
 
     if ($found) {
-        PSI-Log "✅ McAfee removal pass complete (no reboot)."
+        PSI-Log "McAfee removal pass complete (no reboot)."
     } else {
-        PSI-Log "ℹ️ No McAfee products detected. Skipping removal."
+        PSI-Log "No McAfee products detected. Skipping removal."
     }
 }
 
-# Auto-run McAfee removal up front (no reboot). Safe if nothing found.
+# Auto-run McAfee removal up front (no reboot)
 try {
     Remove-McAfee
 } catch {
-    PSI-Log "⚠️ Remove-McAfee encountered an error: $($_.Exception.Message)"
+    PSI-Log "Remove-McAfee encountered an error: $($_.Exception.Message)"
 }
 #endregion PSI Fast Path + McAfee Auto-Removal (No Reboot)
 
 
-﻿param(
+param(
     [string]$timezone,
     [string]$location,
     [string]$computerName,
@@ -263,7 +272,7 @@ function Optimize-DeploymentPerformance {
         
         try {
             $script:OriginalPowerPlan = (powercfg /getactivescheme) -replace '.*GUID: ([a-f0-9\-]+).*', '$1'
-            $highPerf = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"  # High Performance GUID
+            $highPerf = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
             powercfg /setactive $highPerf | Out-Null 2>&1
             Write-Host "Activated HIGH PERFORMANCE power plan (original: $script:OriginalPowerPlan)"
         } catch {
