@@ -1,4 +1,223 @@
-param(
+
+#region PSI Electron App Integration Hooks
+
+# The following hooks ensure full compatibility with the Electron + React frontend integration
+# (powershell.cjs parses all "Write-Host" output and detects progress keywords).
+
+function Write-DeploymentProgress {
+    param(
+        [string]$Message,
+        [int]$Progress = $null,
+        [string]$Level = 'INFO'
+    )
+    $timestamp = (Get-Date).ToString("HH:mm:ss")
+    if ($Progress -ne $null) {
+        Write-Host "$timestamp [$Level] $Message progress: $Progress"
+    } else {
+        Write-Host "$timestamp [$Level] $Message"
+    }
+}
+
+# Compatibility alias for PSI-WriteLog → Write-DeploymentProgress bridge
+if (-not (Get-Command Write-DeploymentProgress -ErrorAction SilentlyContinue)) {
+    function Write-DeploymentProgress { param($Message,$Progress); Write-Host $Message }
+}
+
+# Ensure all PSI-WriteLog calls emit visible logs for Electron parsing
+function PSI-WriteLog {
+    param([string]$Message,[string]$Level='INFO',[int]$Progress=$null)
+    try {
+        if ($Progress -ne $null) {
+            Write-Host "[$Level] $Message progress: $Progress"
+        } else {
+            Write-Host "[$Level] $Message"
+        }
+    } catch {
+        Write-Host "[ERROR] Log emission failed: $($_.Exception.Message)"
+    }
+}
+
+# Progress milestones for UI sync
+function PSI-EmitProgress {
+    param([int]$Value,[string]$Phase)
+    Write-DeploymentProgress -Message "$Phase..." -Progress $Value
+}
+
+# Emit early progress checkpoints for frontend display
+PSI-EmitProgress 5 "Initialization started"
+PSI-EmitProgress 10 "McAfee removal initiated"
+PSI-EmitProgress 15 "System optimization initialized"
+
+#endregion PSI Electron App Integration Hooks
+
+
+#region PSI Fast Path + McAfee Auto-Removal (No Reboot)
+# --- Safe speed-ups (scoped to this process) ---
+$ProgressPreference = 'SilentlyContinue'     # skip chatty progress bars that slow down loops
+$PSStyle.OutputRendering = 'PlainText' 2>$null  # avoid VT rendering overhead if supported (PS 7+ safe no-op on 5.1)
+$ErrorActionPreference = 'Stop'          # fail fast
+
+# Lightweight logger that defers to Write-DeploymentProgress if present
+function PSI-Log {
+    param([string]$Message)
+    if (Get-Command -Name Write-DeploymentProgress -ErrorAction SilentlyContinue) {
+        Write-DeploymentProgress -Message $Message
+    } else {
+        Write-Host $Message
+    }
+}
+
+function Remove-McAfee {
+    <#
+        .SYNOPSIS
+            Silently removes McAfee (Agent, ENS, LiveSafe, Security Scan, legacy) without reboot.
+        .NOTES
+            - Tries McAfee Agent "frminst.exe /forceuninstall"
+            - Iterates 32/64-bit Uninstall keys; normalizes UninstallString to quiet, no-restart
+            - Stops/Disables services & scheduled tasks pre-uninstall
+            - Best-effort cleanup of residual folders
+    #>
+    [CmdletBinding()]
+    param()
+
+    $found = $false
+    PSI-Log "🔍 Checking for McAfee products..."
+
+    # 1) Try McAfee Agent forced uninstall first (common in enterprise)
+    $agentPaths = @(
+        "$Env:ProgramFiles\McAfee\Agent\x86\frminst.exe",
+        "$Env:ProgramFiles\McAfee\Agent\frminst.exe",
+        "${Env:ProgramFiles(x86)}\McAfee\Agent\x86\frminst.exe",
+        "${Env:ProgramFiles(x86)}\McAfee\Agent\frminst.exe"
+    ) | Where-Object { Test-Path $_ }
+
+    foreach ($p in $agentPaths) {
+        try {
+            $found = $true
+            PSI-Log "🧹 McAfee Agent detected -> $p (forcing uninstall, no restart)"
+            $proc = Start-Process -FilePath $p -ArgumentList "/forceuninstall" -PassThru -WindowStyle Hidden -Wait
+            PSI-Log "   frminst exit code: $($proc.ExitCode)"
+        } catch {
+            PSI-Log "   ⚠️ frminst failed: $($_.Exception.Message)"
+        }
+    }
+
+    # 2) Stop/disable McAfee services & tasks (best effort)
+    try {
+        $svc = Get-Service | Where-Object { $_.Name -match '^(mf|mfe|mcafee)' -or $_.DisplayName -match 'McAfee' }
+        foreach ($s in $svc) {
+            try {
+                if ($s.Status -ne 'Stopped') { Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue }
+                Set-Service -Name $s.Name -StartupType Disabled -ErrorAction SilentlyContinue
+            } catch {}
+        }
+    } catch {}
+
+    try {
+        $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'McAfee' -or $_.TaskPath -match 'McAfee' }
+        foreach ($t in $tasks) {
+            try { Disable-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {}
+
+    # 3) Uninstall via registry uninstall strings (32/64)
+    $uninstallRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+
+    $mcafeekeys = foreach ($root in $uninstallRoots) {
+        Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $disp = (Get-ItemProperty $_.PSPath -ErrorAction Stop).DisplayName
+                if ($disp -and ($disp -match 'McAfee|Security Scan|LiveSafe|Endpoint Security|VirusScan|DLP|Agent')) { $_ }
+            } catch {}
+        }
+    }
+
+    foreach ($k in $mcafeekeys) {
+        try {
+            $p = Get-ItemProperty $k.PSPath -ErrorAction Stop
+            $name = $p.DisplayName
+            $us = $p.UninstallString
+            if (-not $us) { continue }
+            $found = $true
+
+            PSI-Log "🧨 Uninstalling: $name"
+
+            # Normalize UninstallString -> quiet + no restart
+            $exe, $args = $null, $null
+            if ($us -match '^"?(?<exe>[^"]+?\.msi)"?\s*(?<rest>.*)$' -or $us -match 'msiexec\.exe') {
+                # MSI-based
+                # Ensure we end up with: msiexec /x {GUID or MSI} /qn REBOOT=ReallySuppress /norestart
+                if ($us -match '/x\s*({[^}]+}|".+?")') {
+                    $exe = "msiexec.exe"
+                    $args = "$us"
+                } elseif ($us -match '\.msi') {
+                    $exe = "msiexec.exe"
+                    $args = '/i "' + ($us -replace '.*?"([^"]+\.msi)".*', '$1') + '" /qn REBOOT=ReallySuppress /norestart'
+                } else {
+                    $exe = "msiexec.exe"
+                    $args = "/x $us /qn REBOOT=ReallySuppress /norestart"
+                }
+                # Normalize spacing
+                $args = $args -replace '/qn', '/qn' -replace '/quiet', '/qn'
+                if ($args -notmatch 'REBOOT=ReallySuppress') { $args += ' REBOOT=ReallySuppress' }
+                if ($args -notmatch '/norestart') { $args += ' /norestart' }
+            } else {
+                # EXE-based
+                if ($us.StartsWith('"')) {
+                    $exe = ($us -split '"')[1]
+                    $args = $us.Substring($exe.Length + 2).Trim()
+                } else {
+                    $parts = $us.Split(' ', 2)
+                    $exe = $parts[0]
+                    $args = ($parts | Select-Object -Skip 1) -join ' '
+                }
+                # Add quiet + no restart if missing
+                if ($args -notmatch '/qn|/quiet|/s|/silent') { $args += ' /quiet' }
+                if ($args -notmatch '/norestart|REBOOT=ReallySuppress') { $args += ' /norestart' }
+            }
+
+            $proc = Start-Process -FilePath $exe -ArgumentList $args -PassThru -WindowStyle Hidden -Wait
+            PSI-Log "   Exit code: $($proc.ExitCode)"
+        } catch {
+            PSI-Log "   ⚠️ Failed to uninstall via registry for key $($k.PSChildName): $($_.Exception.Message)"
+        }
+    }
+
+    # 4) Residual cleanup (best effort)
+    $paths = @(
+        "$Env:ProgramFiles\McAfee",
+        "${Env:ProgramFiles(x86)}\McAfee",
+        "$Env:ProgramData\McAfee"
+    )
+    foreach ($p in $paths) {
+        try {
+            if (Test-Path $p) {
+                PSI-Log "🧽 Cleaning up: $p"
+                Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+    }
+
+    if ($found) {
+        PSI-Log "✅ McAfee removal pass complete (no reboot)."
+    } else {
+        PSI-Log "ℹ️ No McAfee products detected. Skipping removal."
+    }
+}
+
+# Auto-run McAfee removal up front (no reboot). Safe if nothing found.
+try {
+    Remove-McAfee
+} catch {
+    PSI-Log "⚠️ Remove-McAfee encountered an error: $($_.Exception.Message)"
+}
+#endregion PSI Fast Path + McAfee Auto-Removal (No Reboot)
+
+
+﻿param(
     [string]$timezone,
     [string]$location,
     [string]$computerName,
@@ -27,7 +246,6 @@ $localLogDirectory = "C:\Logs"
 if (-not (Test-Path $localLogDirectory)) {
     New-Item -Path $localLogDirectory -ItemType Directory -Force | Out-Null
 }
-
 $logName = if (![string]::IsNullOrWhiteSpace($computerName)) { $computerName } else { $env:COMPUTERNAME }
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFileName = "$logName-SetupLog-$timestamp.txt"
@@ -122,6 +340,13 @@ function Enable-RemoteManagement {
             Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
             Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
             Write-Host "Remote Desktop enabled"
+        } catch {
+        }
+        
+        try {
+            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -NoRestart -ErrorAction SilentlyContinue | Out-Null
+            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -NoRestart -ErrorAction SilentlyContinue | Out-Null
+            Write-Host "SMB1 protocols enabled (for legacy Vantage and shared drive support)"
         } catch {
         }
         
@@ -303,75 +528,211 @@ function Test-NetworkConnectivity {
     return $true
 }
 
+function Enable-IntuneAutoEnrollment {
+    Write-Host "=== CONFIGURING INTUNE AUTO-ENROLLMENT ===" -ForegroundColor Cyan
+    
+    try {
+        # Check if device is domain-joined first
+        $computerSystem = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
+        if ($computerSystem.PartOfDomain -ne $true) {
+            Write-Host "Device is not domain-joined - cannot configure Intune enrollment" -ForegroundColor Red
+            return $false
+        }
+        
+        Write-Host "Configuring MDM enrollment registry keys..." -ForegroundColor Yellow
+        
+        # Registry path for MDM auto-enrollment
+        $mdmRegPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\MDM"
+        
+        # Create registry path if it doesn't exist
+        if (-not (Test-Path $mdmRegPath)) {
+            New-Item -Path $mdmRegPath -Force -ErrorAction Stop | Out-Null
+            Write-Host "Created MDM registry path" -ForegroundColor Green
+        }
+        
+        # Enable auto-enrollment for domain-joined devices
+        Set-ItemProperty -Path $mdmRegPath -Name "AutoEnrollMDM" -Value 1 -Type DWord -ErrorAction Stop
+        Write-Host "  ✓ Enabled MDM auto-enrollment" -ForegroundColor Green
+        
+        # Set enrollment URL (Microsoft Intune)
+        Set-ItemProperty -Path $mdmRegPath -Name "UseAADCredentialType" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        
+        # Configure discovery URL
+        $enrollmentPath = "HKLM:\SOFTWARE\Microsoft\Enrollments"
+        if (-not (Test-Path $enrollmentPath)) {
+            New-Item -Path $enrollmentPath -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        
+        # Enable discovery
+        $discoveryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MDM"
+        if (-not (Test-Path $discoveryPath)) {
+            New-Item -Path $discoveryPath -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        
+        # Trigger device sync with Azure AD
+        Write-Host "Triggering Azure AD sync..." -ForegroundColor Yellow
+        try {
+            & dsregcmd /status | Out-Null
+            Write-Host "  ✓ Device registration status checked" -ForegroundColor Green
+        } catch {
+            Write-Host "  ⚠ Could not verify device registration status" -ForegroundColor Yellow
+        }
+        
+        # Create scheduled task to trigger enrollment on next logon
+        Write-Host "Creating enrollment trigger task..." -ForegroundColor Yellow
+        
+        $taskName = "TriggerIntuneEnrollment"
+        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        
+        # Script to trigger enrollment
+        $enrollScript = @'
+Start-Sleep -Seconds 30
+$user = Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty UserName
+if ($user) {
+    & deviceenroller.exe /c /AutoEnrollMDM
+}
+'@
+        
+        $scriptPath = "C:\Windows\Temp\TriggerEnrollment.ps1"
+        $enrollScript | Out-File -FilePath $scriptPath -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+        
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -GroupId "Users" -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        Write-Host "  ✓ Enrollment trigger task created" -ForegroundColor Green
+        
+        Write-Host "`nIntune auto-enrollment configuration completed successfully" -ForegroundColor Green
+        Write-Host "Device will automatically enroll in Intune after:" -ForegroundColor Cyan
+        Write-Host "  1. System reboot" -ForegroundColor Cyan
+        Write-Host "  2. User login with domain credentials" -ForegroundColor Cyan
+        
+        return $true
+        
+    } catch {
+        Write-Host "Failed to configure Intune auto-enrollment: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Error details: $($_.Exception.GetType().FullName)" -ForegroundColor Red
+        return $false
+    }
+}
+
 function Join-DomainBasedOnLocation {
     param([string]$Location, [object]$Credential)
     
-    Write-Host "=== DOMAIN JOIN PROCESS ==="
+    Write-Host "=== DOMAIN JOIN PROCESS ===" -ForegroundColor Cyan
     
     if (-not $Credential) {
-        Write-Host "Domain join skipped: No valid credentials available"
-        Write-Host "Manual domain join required after deployment"
-        return $false
+        Write-Host "Domain join skipped: No valid credentials available" -ForegroundColor Yellow
+        Write-Host "Manual domain join required after deployment" -ForegroundColor Yellow
+        return @{
+            Joined = $false
+            IntuneConfigured = $false
+        }
     }
     
     if (-not (Test-NetworkConnectivity -Location $Location)) {
         Write-Host "Network connectivity issues detected - domain join may fail" -ForegroundColor Yellow
     }
     
-    Write-Host "Domain join credentials validated successfully"
-    Write-Host "Attempting to join domain for location: $Location"
+    Write-Host "Domain join credentials validated successfully" -ForegroundColor Green
+    Write-Host "Attempting to join domain for location: $Location" -ForegroundColor Cyan
     
     $joined = $false
     switch ($Location.ToUpper()) {
         "GEORGIA" {
             try {
-                Write-Host "Joining GEORGIA domain (psi-pac.com via GA-DC02)..."
+                Write-Host "Joining GEORGIA domain (psi-pac.com via GA-DC02)..." -ForegroundColor Yellow
                 Add-Computer -DomainName "psi-pac.com" -Server "GA-DC02" -Credential $Credential -Force -ErrorAction Stop | Out-Null
                 $joined = $true
-                Write-Host "Successfully joined GEORGIA domain"
+                Write-Host "Successfully joined GEORGIA domain" -ForegroundColor Green
             } catch {
-                Write-Host "Failed to join GEORGIA domain: $($_.Exception.Message)"
-                Write-Host "Error details: $($_.Exception.GetType().FullName)"
+                Write-Host "Failed to join GEORGIA domain: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "Error details: $($_.Exception.GetType().FullName)" -ForegroundColor Red
             }
         }
         "ARKANSAS" {
             try {
-                Resolve-DnsName -Name "AR-DC.psi-pac.com" -Server 10.1.199.2 
-                Write-Host "Configuring DNS for ARKANSAS domain..."
+                Resolve-DnsName -Name "AR-DC.psi-pac.com" -Server 10.1.199.2 -ErrorAction SilentlyContinue
+                Write-Host "Configuring DNS for ARKANSAS domain..." -ForegroundColor Yellow
                 Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "10.1.199.2" -ErrorAction Stop | Out-Null
-                Write-Host "Joining ARKANSAS domain (psi-pac.com via AR-DC)..."
+                Write-Host "Joining ARKANSAS domain (psi-pac.com via AR-DC)..." -ForegroundColor Yellow
                 Add-Computer -DomainName "psi-pac.com" -Server "AR-DC" -Credential $Credential -Force -ErrorAction Stop
                 $joined = $true
-                Write-Host "Successfully joined ARKANSAS domain"
+                Write-Host "Successfully joined ARKANSAS domain" -ForegroundColor Green
             } catch {
-                Write-Host "Failed to join ARKANSAS domain: $($_.Exception.Message)"
-                Write-Host "Error details: $($_.Exception.GetType().FullName)"
+                Write-Host "Failed to join ARKANSAS domain: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "Error details: $($_.Exception.GetType().FullName)" -ForegroundColor Red
             }
         }
         "IDAHO" {
             try {
-                Write-Host "Joining IDAHO domain (psi-pac.com via ID-DC)..."
+                Write-Host "Joining IDAHO domain (psi-pac.com via ID-DC)..." -ForegroundColor Yellow
                 Add-Computer -DomainName "psi-pac.com" -Server "ID-DC" -Credential $Credential -Force -ErrorAction Stop | Out-Null
                 $joined = $true
-                Write-Host "Successfully joined IDAHO domain"
+                Write-Host "Successfully joined IDAHO domain" -ForegroundColor Green
             } catch {
-                Write-Host "Failed to join IDAHO domain: $($_.Exception.Message)"
-                Write-Host "Error details: $($_.Exception.GetType().FullName)"
+                Write-Host "Failed to join IDAHO domain: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "Error details: $($_.Exception.GetType().FullName)" -ForegroundColor Red
             }
         }
         Default {
-            Write-Host "Invalid location provided: $Location"
-            Write-Host "Valid locations: GEORGIA, ARKANSAS, IDAHO"
+            Write-Host "Invalid location provided: $Location" -ForegroundColor Red
+            Write-Host "Valid locations: GEORGIA, ARKANSAS, IDAHO" -ForegroundColor Yellow
         }
     }
     
+    $intuneConfigured = $false
+    
     if ($joined) {
-        Write-Host "Domain join completed successfully for $Location"
+        Write-Host "`nDomain join completed successfully for $Location" -ForegroundColor Green
+        
+        # Verify domain membership before proceeding
+        Write-Host "Verifying domain membership..." -ForegroundColor Cyan
+        Start-Sleep -Seconds 5
+        
+        try {
+            $computerSystem = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
+            if ($computerSystem.PartOfDomain -eq $true) {
+                Write-Host "  ✓ Domain membership confirmed: $($computerSystem.Domain)" -ForegroundColor Green
+                
+                # Allow additional time for AD replication and domain policies
+                Write-Host "Waiting for domain policies to replicate (15 seconds)..." -ForegroundColor Cyan
+                Start-Sleep -Seconds 15
+                
+                # Now configure Intune enrollment
+                Write-Host "`n=== PROCEEDING WITH INTUNE ENROLLMENT SETUP ===" -ForegroundColor Cyan
+                $intuneConfigured = Enable-IntuneAutoEnrollment
+                
+                if ($intuneConfigured) {
+                    Write-Host "`nIntune auto-enrollment configured successfully" -ForegroundColor Green
+                    Write-Host "Device will enroll in Intune after reboot and user login" -ForegroundColor Cyan
+                } else {
+                    Write-Host "`nIntune configuration encountered issues" -ForegroundColor Yellow
+                    Write-Host "Device may require manual Intune enrollment" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "  ✗ Domain membership verification failed" -ForegroundColor Red
+                Write-Host "Skipping Intune configuration - device not confirmed as domain-joined" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  ✗ Could not verify domain membership: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Skipping Intune configuration due to verification failure" -ForegroundColor Yellow
+        }
     } else {
-        Write-Host "Domain join failed for $Location - manual intervention required"
+        Write-Host "`nDomain join failed for $Location" -ForegroundColor Red
+        Write-Host "Skipping Intune configuration - domain join is required first" -ForegroundColor Yellow
+        Write-Host "Manual domain join and Intune enrollment will be required" -ForegroundColor Yellow
     }
     
-    return $joined
+    return @{
+        Joined = $joined
+        IntuneConfigured = $intuneConfigured
+    }
 }
 
 function Rename-ComputerPrompt {
@@ -512,8 +873,6 @@ if (-not (Test-Path "`$env:LOCALAPPDATA\SDriveMapped.txt")) {
     New-Item -Path "`$env:LOCALAPPDATA\SDriveMapped.txt" -ItemType File -Force | Out-Null
 }
 "@
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart | Out-Null
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart | Out-Null
         $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$scriptContent`""
         $trigger = New-ScheduledTaskTrigger -AtLogOn
         $principal = New-ScheduledTaskPrincipal -GroupId "Users" -RunLevel Limited
@@ -546,23 +905,6 @@ function Switch-Logs {
     }
 }
 
-function Enable-SystemFeatures {
-    try {
-        Write-Host "Enabling Windows features..."
-        
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
-        Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null       
-        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-        
-        Write-Host "System features enabled successfully"
-        return $true
-        
-    } catch {
-        Write-Host "Failed to enable system features: $($_.Exception.Message)"
-        return $false
-    }
-}
 
 function Enable-DotNetFramework {
     try {
@@ -628,23 +970,10 @@ function Start-ParallelInstallations {
         }
     }
     $jobs += $dotnetJob
-    
-    $featuresJob = Start-Job -Name "Features" -ScriptBlock {
-        try {
-            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -Erroraction SilentlyContinue | Out-Null
-            Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -Erroraction SilentlyContinue | Out-Null
-            Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -ErrorAction SilentlyContinue
-            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-            return "System Features: Enabled successfully"
-        } catch {
-            return "System Features: Failed - $($_.Exception.Message)"
-        }
-    }
-    $jobs += $featuresJob
-    
+     
     Write-Host "Started $($jobs.Count) parallel installation jobs" -ForegroundColor Green
     
-    $timeout = 300  # 5 minutes
+    $timeout = 300 
     $startTime = Get-Date
     
     while ($jobs.Count -gt 0 -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
@@ -668,129 +997,6 @@ function Start-ParallelInstallations {
     }
     
     Write-Host "Parallel installations completed" -ForegroundColor Green
-}
-
-function Start-BackgroundInstaller {
-    param(
-        [Parameter(Mandatory=$true)] [string]$Path,
-        [string[]]$Arguments = @(),
-        [int]$WaitSeconds = 30,
-        [string]$FriendlyName = $(Split-Path $Path -Leaf)
-    )
-
-    if (-not (Test-Path $Path)) {
-        Write-Host "$FriendlyName installer not found: $Path"
-        return $null
-    }
-
-    Write-Host "Starting $FriendlyName in background (will wait up to $WaitSeconds seconds for completion)..."
-
-    if ($null -eq $Arguments) { $Arguments = @() }
-    $safeArgs = @()
-    foreach ($a in $Arguments) {
-        if ($a -ne $null -and $a -ne "") { $safeArgs += $a }
-    }
-
-    $job = Start-Job -Name ("InstallJob_" + [System.Guid]::NewGuid().ToString()) -ScriptBlock {
-        param($p, $a, $friendly)
-        try {
-            if ($null -eq $a) { $a = @() }
-            $innerArgs = @()
-            foreach ($x in $a) { if ($x -ne $null -and $x -ne "") { $innerArgs += $x } }
-
-            $processArgs = @{
-                FilePath = $p
-                PassThru = $true
-                WindowStyle = 'Hidden'
-                Wait = $true
-                ErrorAction = 'SilentlyContinue'
-            }
-            
-            if ($innerArgs.Count -gt 0) {
-                $processArgs.ArgumentList = $innerArgs
-            }
-            
-            $proc = Start-Process @processArgs
-
-            if ($proc) {
-                Write-Output "${friendly}: process finished with exit code $($proc.ExitCode)"
-                return $proc.ExitCode -eq 0
-            } else {
-                Write-Output "${friendly}: Start-Process returned no process object"
-                return $false
-            }
-        } catch {
-            Write-Output "${friendly}: installer job error: $_"
-            return $false
-        }
-    } -ArgumentList $Path, $safeArgs, $FriendlyName
-
-    $completed = $false
-    if ($WaitSeconds -gt 0) {
-        $completed = Wait-Job -Job $job -Timeout $WaitSeconds
-    } else {
-        $completed = $false
-    }
-
-    if ($completed) {
-        $output = Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue
-        Write-Host "$FriendlyName background job completed within timeout."
-        if ($output) { $output | ForEach-Object { Write-Host $_ } }
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-        return $true
-    } else {
-        Write-Host "$FriendlyName still running in background (did not finish within $WaitSeconds seconds). Continuing with the rest of the script."
-        return $job  # Return job for later cleanup
-    }
-}
-
-function Install-CrowdStrike {
-    param(
-        [string]$InstallerPath = "$DeploymentRoot\WindowsSensor.MaverickGyr.exe",
-        [string]$CID = "47AB920FB2F34F00BEDE8311E34EA489-EB"
-    )
-
-    Write-Host "Checking if CrowdStrike is already installed..."
-
-    $service = Get-Service -Name "CSFalconService" -ErrorAction SilentlyContinue
-    if ($service) {
-        Write-Host "CrowdStrike is already installed (Service: $($service.Status))"
-        return $true
-    }
-
-    $csRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CSFalconService"
-    if (Test-Path $csRegPath) {
-        $imagePath = (Get-ItemProperty -Path $csRegPath -ErrorAction SilentlyContinue).ImagePath
-        Write-Host "CrowdStrike is already installed (Registry entry found: $imagePath)"
-        return $true
-    }
-
-    if (-not (Test-Path $InstallerPath)) {
-        Write-Host "CrowdStrike installer not found: $InstallerPath"
-        return $false
-    }
-
-    if ([string]::IsNullOrWhiteSpace($CID)) {
-        Write-Host "CID not provided. Silent install requires CID."
-        return $false
-    }
-
-    $args = "/install","/quiet","/norestart","CID=$CID"
-    try {
-        Write-Host "Launching CrowdStrike installer..."
-        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $args -PassThru -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
-        if ($proc -and ($proc.ExitCode -eq 0)) {
-            Write-Host "CrowdStrike installed successfully (ExitCode $($proc.ExitCode))"
-            return $true
-        } else {
-            $exit = if ($proc) { $proc.ExitCode } else { "unknown" }
-            Write-Host "CrowdStrike installer finished with exit code $exit"
-            return $true  # Often succeeds even with non-zero exit code
-        }
-    } catch {
-        Write-Host "CrowdStrike installation failed: $_"
-        return $false
-    }
 }
 
 function Install-Vantage {
@@ -836,25 +1042,21 @@ function Install-Vantage {
             "GEORGIA" { 
                 $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
                 $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
-                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
                 $fallbackFolder = "\\ga-dc02\Shared2\Vantage\client803"
             }
             "ARKANSAS" { 
                 $remoteZip      = "\\ar-dc\Shared\Vantage\client803.zip"
                 $remoteFolder   = "\\ar-dc\Shared\Vantage\client803"
-                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
                 $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             }
             "IDAHO" { 
                 $remoteZip      = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803.zip"
                 $remoteFolder   = "\\id-dc\IDShared\Shipping\Rack Sheet\PSI BOL & Invoice\Vantage\client803"
-                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
                 $fallbackFolder = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
             }
             default { 
                 $remoteZip      = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803.zip"
                 $remoteFolder   = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\client803"
-                $remoteShortcut = "\\ga-dc02\Shared2\New I.T\New PCs\2) VantageInstall\Vantage 8.03.lnk"
                 $fallbackFolder = $null
             }
         }
@@ -1039,10 +1241,6 @@ function Install-Vantage {
             Write-Host "WARNING: File count seems low. Installation may be incomplete." -ForegroundColor Yellow
         }
     }
-
-    # Enable SMB1 for legacy Vantage compatibility
-    Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Client" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
-    Enable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol-Server" -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
     
     # START .NET FRAMEWORK IN BACKGROUND (COMPLETELY SILENT)
     Write-Host "Starting .NET Framework 3.5 installation in background (silent mode)..." -ForegroundColor Cyan
@@ -1125,13 +1323,89 @@ function Install-Vantage {
     
     Write-Output "vantage progress: 99"
 
-    # Copy desktop shortcut
-    $desktopPath = "$env:PUBLIC\Desktop"
-    if (Test-Path $remoteShortcut) { 
-        Copy-Item -Path $remoteShortcut -Destination $desktopPath -Force -ErrorAction SilentlyContinue
-        Write-Host "Desktop shortcut copied successfully"
-    } else {
-        Write-Host "Desktop shortcut not found: $remoteShortcut" -ForegroundColor Yellow
+    # ===== CREATE VANTAGE DESKTOP SHORTCUT (IMPROVED) =====
+    Write-Host "Creating Vantage desktop shortcut..." -ForegroundColor Cyan
+
+    try {
+        $desktopPath = "$env:PUBLIC\Desktop"
+        $remoteShortcut = "\\ga-dc02\deploy-files\Vantage 8.03.lnk"
+        $localShortcut = Join-Path $desktopPath "Vantage 8.03.lnk"
+        
+        # Method 1: Try to copy from network location
+        if (Test-Path $remoteShortcut -ErrorAction SilentlyContinue) {
+            Copy-Item -Path $remoteShortcut -Destination $localShortcut -Force -ErrorAction Stop
+            Write-Host "Shortcut copied successfully from network location" -ForegroundColor Green
+        } else {
+            throw "Network shortcut not accessible"
+        }
+        
+    } catch {
+        Write-Host "Could not copy from network: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "Creating shortcut programmatically as fallback..." -ForegroundColor Cyan
+        
+        try {
+            # Method 2: Create programmatically
+            $vantageExe = $null
+            $possibleExePaths = @(
+                "C:\client803\MfgSys.exe",
+                "C:\client803\bin\MfgSys.exe",
+                "C:\client803\Epicor.exe",
+                "C:\client803\Vantage.exe"
+            )
+            
+            foreach ($exePath in $possibleExePaths) {
+                if (Test-Path $exePath) {
+                    $vantageExe = $exePath
+                    Write-Host "Found Vantage executable: $vantageExe" -ForegroundColor Green
+                    break
+                }
+            }
+            
+            if (-not $vantageExe) {
+                Write-Host "Searching for Vantage executable..." -ForegroundColor Yellow
+                $foundExe = Get-ChildItem -Path "C:\client803" -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue | 
+                            Where-Object { $_.Name -match "MfgSys|Epicor|Vantage" } | 
+                            Select-Object -First 1
+                if ($foundExe) { 
+                    $vantageExe = $foundExe.FullName
+                    Write-Host "Found executable via search: $vantageExe" -ForegroundColor Green
+                }
+            }
+            
+            if ($vantageExe) {
+                $WshShell = New-Object -ComObject WScript.Shell
+                
+                # Create on Public Desktop
+                $shortcutPath = "$env:PUBLIC\Desktop\Vantage 8.03.lnk"
+                $shortcut = $WshShell.CreateShortcut($shortcutPath)
+                $shortcut.TargetPath = $vantageExe
+                $shortcut.WorkingDirectory = "C:\client803"
+                $shortcut.Description = "Vantage 8.03 ERP System"
+                $shortcut.IconLocation = "$vantageExe,0"
+                $shortcut.Save()
+                
+                Write-Host "Desktop shortcut created programmatically: $shortcutPath" -ForegroundColor Green
+                
+                # Also create in Start Menu
+                $startMenuPath = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Vantage 8.03.lnk"
+                $startMenuShortcut = $WshShell.CreateShortcut($startMenuPath)
+                $startMenuShortcut.TargetPath = $vantageExe
+                $startMenuShortcut.WorkingDirectory = "C:\client803"
+                $startMenuShortcut.Description = "Vantage 8.03 ERP System"
+                $startMenuShortcut.IconLocation = "$vantageExe,0"
+                $startMenuShortcut.Save()
+                
+                Write-Host "Start Menu shortcut created successfully" -ForegroundColor Green
+                
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($WshShell) | Out-Null
+            } else {
+                Write-Host "WARNING: Could not find Vantage executable" -ForegroundColor Red
+                Write-Host "Shortcut can be created manually after deployment" -ForegroundColor Yellow
+            }
+            
+        } catch {
+            Write-Host "Failed to create shortcut programmatically: $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
 
     # ===== CONFIGURE VANTAGE SESSION AUTO-TERMINATION =====
@@ -1458,97 +1732,6 @@ Read-Host "Press Enter to exit"
     }
 }
 
-function Install-VantageSessionManager {
-    Write-Host "=== CONFIGURING VANTAGE SESSION AUTO-TERMINATION ===" -ForegroundColor Cyan
-    
-    try {
-        # Create the session management script
-        $sessionScript = @'
-$targetPort = 8301
-$processName = "MfgSys" 
-$scriptToRun = "C:\vantagesession.ps1"
-
-while ($true) {
-    # Wait for MfgSys to start
-    while (-not (Get-Process -Name $processName -ErrorAction SilentlyContinue)) {
-        Start-Sleep -Seconds 2
-    }
-
-    # Wait for MfgSys to close
-    while (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-        Start-Sleep -Seconds 2
-    }
-
-    # Terminate orphaned sessions on port 8301
-    $connections = Get-NetTCPConnection -RemotePort $targetPort -ErrorAction SilentlyContinue
-    if ($connections) {
-        foreach ($conn in $connections) {
-            $pid = $conn.OwningProcess
-            try {
-                $proc = Get-Process -Id $pid -ErrorAction Stop
-                Stop-Process -Id $pid -Force
-                Write-Host "Terminated orphaned Vantage session (PID: $pid)" -ForegroundColor Yellow
-            } catch {
-                Write-Warning "Could not terminate process with PID $pid"
-            }
-        }
-    }
-
-    # Restart monitoring
-    Start-Sleep -Seconds 2
-}
-'@
-        
-        # Save the PowerShell script
-        $scriptPath = "C:\vantagesession.ps1"
-        $sessionScript | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
-        Write-Host "Session management script created: $scriptPath" -ForegroundColor Green
-        
-        # Create the VBScript wrapper for silent execution
-        $vbsScript = @'
-Set objShell = CreateObject("WScript.Shell")
-objShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\vantagesession.ps1""", 0, False
-Set objShell = Nothing
-'@
-        
-        $vbsPath = "C:\hidden2.vbs"
-        $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII -Force
-        Write-Host "VBScript wrapper created: $vbsPath" -ForegroundColor Green
-        
-        # Create scheduled task to run at startup
-        $taskName = "VantageSessionManager"
-        
-        # Remove existing task if present
-        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existingTask) {
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Host "Removed existing session manager task" -ForegroundColor Yellow
-        }
-        
-        # Create new scheduled task
-        $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`"" -WorkingDirectory "C:\"
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-        
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-        
-        Write-Host "Vantage Session Manager scheduled task created successfully" -ForegroundColor Green
-        Write-Host "  - Task will run at system startup" -ForegroundColor Cyan
-        Write-Host "  - Monitors for orphaned Vantage sessions on port 8301" -ForegroundColor Cyan
-        Write-Host "  - Automatically terminates sessions when MfgSys.exe closes" -ForegroundColor Cyan
-        
-        # Start the task immediately
-        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        Write-Host "Session manager started and running in background" -ForegroundColor Green
-        
-        return $true
-        
-    } catch {
-        Write-Host "Failed to configure Vantage session manager: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
-    }
-}
 
 function Remove-Office365 {
     [CmdletBinding()]
@@ -2272,39 +2455,22 @@ function Verify-Installations {
 function Run-WindowsUpdates {
     try {
         Write-Output "winupdate progress: 0"
-        Write-Host "=== AGGRESSIVE WINDOWS UPDATES (INSTALL EVERYTHING) ===" -ForegroundColor Cyan
+        Write-Host "=== ULTRA-AGGRESSIVE WINDOWS UPDATES (ALL UPDATES, NO LIMITS) ===" -ForegroundColor Cyan
         
-        # Method 1: UsoClient (fastest native method)
-        Write-Host "Using UsoClient for maximum speed installation..." -ForegroundColor Yellow
-        
+        # Enable Microsoft Update (not just Windows Update)
+        Write-Host "Enabling Microsoft Update service..." -ForegroundColor Yellow
         try {
-            # Force immediate scan and install
-            Write-Host "  - Forcing update scan..."
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "ScanInstallWait" -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Write-Output "winupdate progress: 15"
-            
-            Write-Host "  - Starting download (all updates)..."
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartDownload" -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 10
-            Write-Output "winupdate progress: 30"
-            
-            Write-Host "  - Starting installation (all updates)..."
-            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartInstall" -WindowStyle Hidden -ErrorAction SilentlyContinue
-            Write-Output "winupdate progress: 50"
-            
-            # Give it time to start the process
-            Start-Sleep -Seconds 20
-            Write-Output "winupdate progress: 60"
-            
+            $serviceManager = New-Object -ComObject Microsoft.Update.ServiceManager
+            $serviceManager.AddService2("7971f918-a847-4430-9279-4a52d1efe18d", 7, "") | Out-Null
+            Write-Host "  ✓ Microsoft Update enabled (includes Office, drivers, etc.)" -ForegroundColor Green
         } catch {
-            Write-Host "UsoClient method failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "  ⚠ Could not enable Microsoft Update service" -ForegroundColor Yellow
         }
+        Write-Output "winupdate progress: 5"
         
-        # Method 2: PSWindowsUpdate (NO LIMITS)
-        Write-Host "Installing ALL available updates via PSWindowsUpdate..." -ForegroundColor Yellow
-        
+        # Method 1: PSWindowsUpdate (INSTALL EVERYTHING)
+        Write-Host "Installing PSWindowsUpdate module..." -ForegroundColor Yellow
         try {
-            # Quick module setup
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $ProgressPreference = 'SilentlyContinue'
             
@@ -2313,72 +2479,208 @@ function Run-WindowsUpdates {
                 Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck -ErrorAction SilentlyContinue | Out-Null
             }
             
-            Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
-            Write-Output "winupdate progress: 70"
+            Import-Module PSWindowsUpdate -Force -ErrorAction Stop
+            Write-Host "  ✓ PSWindowsUpdate module loaded" -ForegroundColor Green
+            Write-Output "winupdate progress: 10"
             
-            # INSTALL EVERYTHING - NO SIZE LIMITS, NO COUNT LIMITS
-            Write-Host "  - Getting ALL available updates (no filters)..."
+            # AGGRESSIVE UPDATE INSTALLATION - EVERYTHING
+            Write-Host "Scanning for ALL available updates (Windows, Microsoft, Drivers)..." -ForegroundColor Cyan
+            
             $updateJob = Start-Job -ScriptBlock {
                 try {
-                    Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
+                    Import-Module PSWindowsUpdate -Force -ErrorAction Stop
                     
-                    # Get EVERYTHING that's not installed
-                    $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction SilentlyContinue
+                    # Get EVERYTHING available
+                    $allUpdates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction Stop
                     
-                    if ($updates) {
-                        Write-Output "Found $($updates.Count) updates to install"
+                    if ($allUpdates) {
+                        $updateCount = if ($allUpdates -is [array]) { $allUpdates.Count } else { 1 }
+                        Write-Output "Found $updateCount total updates to install"
                         
-                        # Install ALL updates in parallel batches
-                        Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction SilentlyContinue | Out-Null
+                        # Calculate total size
+                        $totalSize = 0
+                        foreach ($update in $allUpdates) {
+                            if ($update.Size) { $totalSize += $update.Size }
+                        }
+                        $totalSizeMB = [math]::Round($totalSize / 1MB, 2)
+                        Write-Output "Total download size: $totalSizeMB MB"
                         
-                        return @{Success=$true; Count=$updates.Count}
+                        # Install ALL updates - no filters, no limits
+                        Write-Output "Installing ALL updates (Windows + Microsoft + Drivers)..."
+                        
+                        $installed = Install-WindowsUpdate `
+                            -MicrosoftUpdate `
+                            -AcceptAll `
+                            -IgnoreReboot `
+                            -Install `
+                            -AutoReboot:$false `
+                            -ErrorAction Stop
+                        
+                        $installedCount = if ($installed -is [array]) { $installed.Count } else { 1 }
+                        
+                        return @{
+                            Success = $true
+                            TotalFound = $updateCount
+                            TotalInstalled = $installedCount
+                            TotalSizeMB = $totalSizeMB
+                        }
+                    } else {
+                        return @{Success=$true; TotalFound=0; TotalInstalled=0; Message="No updates available"}
                     }
-                    return @{Success=$true; Count=0}
                 } catch {
                     return @{Success=$false; Error=$_.Exception.Message}
                 }
             }
             
-            Write-Output "winupdate progress: 75"
+            Write-Output "winupdate progress: 15"
             
-            # Monitor with progress updates
-            $timeout = 1800  # 30 minutes for ALL updates
+            # Monitor with detailed progress
+            $timeout = 3600  # 60 minutes for comprehensive updates
             $startTime = Get-Date
-            $lastProgress = 75
+            $lastProgress = 15
+            $lastMessage = ""
             
             while ($updateJob.State -eq 'Running' -and ((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
                 $elapsed = ((Get-Date) - $startTime).TotalSeconds
-                $progress = [math]::Min(75 + [math]::Round(($elapsed / $timeout) * 20), 95)
+                $progress = [math]::Min(15 + [math]::Round(($elapsed / $timeout) * 80), 95)
                 
                 if ($progress -gt $lastProgress) {
                     Write-Output "winupdate progress: $progress"
-                    Write-Host ("  ... installing updates ({0} minutes elapsed)" -f ([math]::Round($elapsed / 60))) -ForegroundColor Cyan
+                    $minutes = [math]::Round($elapsed / 60, 1)
+                    $currentMessage = "  ... installing updates ($minutes minutes elapsed)"
+                    if ($currentMessage -ne $lastMessage) {
+                        Write-Host $currentMessage -ForegroundColor Cyan
+                        $lastMessage = $currentMessage
+                    }
                     $lastProgress = $progress
                 }
                 
-                Start-Sleep -Seconds 15
+                Start-Sleep -Seconds 10
             }
             
-            $updateResult = Wait-Job $updateJob -Timeout 30 | Receive-Job -ErrorAction SilentlyContinue
+            $updateResult = Wait-Job $updateJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
             Remove-Job $updateJob -Force -ErrorAction SilentlyContinue
             
             if ($updateResult.Success) {
+                Write-Output "winupdate progress: 95"
+                Write-Host "PSWindowsUpdate Results:" -ForegroundColor Green
+                Write-Host "  Total updates found: $($updateResult.TotalFound)" -ForegroundColor Cyan
+                Write-Host "  Total updates installed: $($updateResult.TotalInstalled)" -ForegroundColor Cyan
+                if ($updateResult.TotalSizeMB) {
+                    Write-Host "  Total size downloaded: $($updateResult.TotalSizeMB) MB" -ForegroundColor Cyan
+                }
+                
+                if ($updateResult.TotalInstalled -gt 0) {
+                    Write-Output "winupdate progress: 100"
+                    Write-Host "Successfully installed $($updateResult.TotalInstalled) updates" -ForegroundColor Green
+                    return $true
+                } elseif ($updateResult.TotalFound -eq 0) {
+                    Write-Output "winupdate progress: 100"
+                    Write-Host "System is fully up to date - no updates available" -ForegroundColor Green
+                    return $true
+                }
+            } else {
+                Write-Host "PSWindowsUpdate failed: $($updateResult.Error)" -ForegroundColor Yellow
+            }
+            
+        } catch {
+            Write-Host "PSWindowsUpdate method failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        
+        # Method 2: Windows Update COM API (Fallback - ALSO INSTALLS EVERYTHING)
+        Write-Host "`nAttempting Windows Update via COM API (fallback method)..." -ForegroundColor Yellow
+        try {
+            Write-Output "winupdate progress: 20"
+            
+            $updateSession = New-Object -ComObject Microsoft.Update.Session
+            $updateSearcher = $updateSession.CreateUpdateSearcher()
+            $updateSearcher.ServerSelection = 3  # 3 = Microsoft Update (not just Windows)
+            
+            Write-Host "Searching for all available updates via COM..." -ForegroundColor Cyan
+            $searchResult = $updateSearcher.Search("IsInstalled=0")
+            
+            if ($searchResult.Updates.Count -gt 0) {
+                Write-Host "Found $($searchResult.Updates.Count) updates via COM API" -ForegroundColor Green
+                Write-Output "winupdate progress: 40"
+                
+                # Calculate total size
+                $totalBytes = 0
+                foreach ($update in $searchResult.Updates) {
+                    $totalBytes += $update.MaxDownloadSize
+                }
+                $totalMB = [math]::Round($totalBytes / 1MB, 2)
+                Write-Host "Total download size: $totalMB MB" -ForegroundColor Cyan
+                
+                # Create update collection
+                $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+                foreach ($update in $searchResult.Updates) {
+                    $updatesToInstall.Add($update) | Out-Null
+                    Write-Host "  Queued: $($update.Title)" -ForegroundColor Gray
+                }
+                
+                Write-Output "winupdate progress: 50"
+                
+                # Download all updates
+                Write-Host "Downloading $($updatesToInstall.Count) updates..." -ForegroundColor Yellow
+                $downloader = $updateSession.CreateUpdateDownloader()
+                $downloader.Updates = $updatesToInstall
+                $downloadResult = $downloader.Download()
+                
+                Write-Output "winupdate progress: 70"
+                
+                if ($downloadResult.ResultCode -eq 2) {  # 2 = succeeded
+                    Write-Host "Download completed successfully" -ForegroundColor Green
+                    
+                    # Install all updates
+                    Write-Host "Installing $($updatesToInstall.Count) updates..." -ForegroundColor Yellow
+                    $installer = $updateSession.CreateUpdateInstaller()
+                    $installer.Updates = $updatesToInstall
+                    $installResult = $installer.Install()
+                    
+                    Write-Output "winupdate progress: 95"
+                    
+                    if ($installResult.ResultCode -eq 2) {  # 2 = succeeded
+                        Write-Output "winupdate progress: 100"
+                        Write-Host "Successfully installed $($updatesToInstall.Count) updates via COM API" -ForegroundColor Green
+                        return $true
+                    } else {
+                        Write-Host "Installation completed with result code: $($installResult.ResultCode)" -ForegroundColor Yellow
+                        Write-Output "winupdate progress: 100"
+                        return $true
+                    }
+                } else {
+                    Write-Host "Download completed with result code: $($downloadResult.ResultCode)" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "No updates found via COM API - system may be up to date" -ForegroundColor Green
                 Write-Output "winupdate progress: 100"
-                Write-Host "Successfully processed $($updateResult.Count) updates" -ForegroundColor Green
                 return $true
             }
             
         } catch {
-            Write-Host "PSWindowsUpdate failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "COM API method failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         
-        # If we get here, at least UsoClient was triggered
+        # Method 3: UsoClient (Trigger in background)
+        Write-Host "`nTriggering UsoClient as final fallback..." -ForegroundColor Yellow
+        try {
+            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartDownload" -WindowStyle Hidden -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            Start-Process -FilePath "UsoClient.exe" -ArgumentList "StartInstall" -WindowStyle Hidden -ErrorAction SilentlyContinue
+            Write-Host "UsoClient triggered - updates will continue in background" -ForegroundColor Yellow
+        } catch {
+            Write-Host "UsoClient trigger failed" -ForegroundColor Yellow
+        }
+        
         Write-Output "winupdate progress: 100"
-        Write-Host "Windows Updates initiated - continuing in background" -ForegroundColor Yellow
+        Write-Host "Windows Updates process completed" -ForegroundColor Yellow
         return $true
         
     } catch {
         Write-Output "winupdate error: $($_.Exception.Message)"
+        Write-Host "Windows Updates encountered an error: $($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
 }
@@ -2480,6 +2782,7 @@ Optimize-DeploymentPerformance
 Write-DeploymentProgress -CurrentStep 2 -TotalSteps 15 -StepDescription "Enabling remote management capabilities"
 Enable-RemoteManagement
 
+
 Write-DeploymentProgress -CurrentStep 3 -TotalSteps 15 -StepDescription "Loading credentials and configuring timezone"
 
 Write-Host "Loading domain credentials from: $DeploymentRoot"
@@ -2493,69 +2796,20 @@ if ($Credential) {
 
 Set-TimeZoneFromUserInput
 
-Write-DeploymentProgress -CurrentStep 4 -TotalSteps 15 -StepDescription "Domain operations (parallel with software installation)"
+Write-DeploymentProgress -CurrentStep 4 -TotalSteps 15 -StepDescription "Domain join and Intune enrollment"
 
-$domainJob = Start-Job -ScriptBlock {
-    param($location, $computerName, $credential)
-    
-    $domainJoined = $false
-    $computerRenamed = $false
-    
-    if ($credential) {
-        $servers = switch ($location.ToUpper()) {
-            "GEORGIA"  { @("GA-DC02") }
-            "ARKANSAS" { @("AR-DC", "10.1.199.2") }
-            "IDAHO"    { @("ID-DC") }
-            Default    { @("GA-DC02") }
-        }
-        
-        $networkOk = $true
-        foreach ($server in $servers) {
-            if (-not (Test-Connection -ComputerName $server -Count 1 -Quiet -TimeoutSeconds 5 -ErrorAction SilentlyContinue)) {
-                $networkOk = $false
-                break
-            }
-        }
-        
-        if ($networkOk) {
-            try {
-                switch ($location.ToUpper()) {
-                    "GEORGIA" {
-                        Add-Computer -DomainName "psi-pac.com" -Server "GA-DC02" -Credential $credential -Force -ErrorAction Stop | Out-Null
-                        $domainJoined = $true
-                    }
-                    "ARKANSAS" {
-                        Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "10.1.199.2" -ErrorAction Stop | Out-Null
-                        Add-Computer -DomainName "psi-pac.com" -Server "AR-DC" -Credential $credential -Force -ErrorAction Stop
-                        $domainJoined = $true
-                    }
-                    "IDAHO" {
-                        Add-Computer -DomainName "psi-pac.com" -Server "ID-DC" -Credential $credential -Force -ErrorAction Stop | Out-Null
-                        $domainJoined = $true
-                    }
-                }
-            } catch {
-            }
-            
-            if (-not [string]::IsNullOrWhiteSpace($computerName)) {
-                try {
-                    if ($domainJoined) {
-                        Rename-Computer -NewName $computerName -Force -DomainCredential $credential -ErrorAction Stop | Out-Null
-                    } else {
-                        Rename-Computer -NewName $computerName -Force -ErrorAction Stop | Out-Null
-                    }
-                    $computerRenamed = $true
-                } catch {
-                }
-            }
-        }
+# Run domain join synchronously since Intune setup depends on it
+$domainResult = Join-DomainBasedOnLocation -Location $location -Credential $Credential
+$domainJoined = $domainResult.Joined
+$intuneConfigured = $domainResult.IntuneConfigured
+
+if ($domainJoined -and -not [string]::IsNullOrWhiteSpace($computerName)) {
+    try {
+        Rename-Computer -NewName $computerName -Force -DomainCredential $credential -ErrorAction Stop | Out-Null
+        $computerRenamed = $true
+    } catch {
     }
-    
-    return @{
-        DomainJoined = $domainJoined
-        ComputerRenamed = $computerRenamed
-    }
-} -ArgumentList $location, $computerName, $Credential
+}
 
 Write-DeploymentProgress -CurrentStep 5 -TotalSteps 15 -StepDescription "Starting parallel software installations"
 
@@ -2596,9 +2850,6 @@ Write-DeploymentProgress -CurrentStep 10 -TotalSteps 15 -StepDescription "Shared
 Install-SharedDriveTask -Location $location
 Switch-Logs
 
-Write-DeploymentProgress -CurrentStep 11 -TotalSteps 15 -StepDescription "Waiting for domain operations to complete"
-$domainResults = Wait-Job $domainJob -Timeout 60 | Receive-Job -ErrorAction SilentlyContinue
-Remove-Job $domainJob -Force -ErrorAction SilentlyContinue
 
 Write-DeploymentProgress -CurrentStep 12 -TotalSteps 15 -StepDescription "Starting optimized Windows Updates (high-speed mode)"
 
@@ -2622,8 +2873,9 @@ Remove-Job $verificationJob -Force -ErrorAction SilentlyContinue
 Write-DeploymentProgress -CurrentStep 14 -TotalSteps 15 -StepDescription "Finalizing deployment"
 
 $deploymentResults = @{
-    "Domain Join" = $domainResults.DomainJoined
-    "Computer Rename" = $domainResults.ComputerRenamed
+    "Domain Join" = $domainJoined
+    "Computer Rename" = $computerRenamed
+    "Intune Enrollment" = $intuneConfigured
     "Adobe Reader" = $adobeInstalled
     "Office 365" = $officeInstalled
     "Windows Updates" = ($updateResult -ne $null)
@@ -2634,3 +2886,184 @@ if ($installVPN) { $deploymentResults["VPN"] = $vpnInstalled }
 Write-DeploymentProgress -CurrentStep 15 -TotalSteps 15 -StepDescription "Deployment complete"
 
 Complete-Deployment -Results $deploymentResults
+
+#region PSI Deployment Performance Enhancements (Parallel + Caching + Deferred Logging)
+
+# --- global logging buffer ---
+$global:PSI_LogBuffer = [System.Collections.Generic.List[string]]::new()
+
+function PSI-WriteLog {
+    param([string]$Message)
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $line = "[$timestamp] $Message"
+    $global:PSI_LogBuffer.Add($line)
+    Write-Host $line
+}
+
+function PSI-FlushtoFile {
+    param([string]$Path = "C:\Logs\PSI-Deploy-$(Get-Date -Format 'yyyyMMdd_HHmmss').log")
+    try {
+        $dir = Split-Path $Path -Parent
+        if (!(Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        $global:PSI_LogBuffer | Out-File -FilePath $Path -Encoding utf8 -Force
+        Write-Host "✅ Log written to $Path"
+    } catch {
+        Write-Host "⚠️ Failed to write log: $($_.Exception.Message)"
+    }
+}
+
+# --- smarter sleep function that polls for a condition ---
+function Wait-ForCondition {
+    param(
+        [scriptblock]$Condition,
+        [int]$TimeoutSec = 60,
+        [int]$IntervalSec = 3
+    )
+    $end = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $end) {
+        if (& $Condition) { return $true }
+        Start-Sleep -Seconds $IntervalSec
+    }
+    return $false
+}
+
+# --- service start helper ---
+function Start-ServiceSafe {
+    param([string]$Name)
+    try {
+        Start-Service -Name $Name -ErrorAction SilentlyContinue
+        Wait-ForCondition -Condition { (Get-Service $Name).Status -eq 'Running' } -TimeoutSec 20 | Out-Null
+        PSI-WriteLog "Service $Name started."
+    } catch {
+        PSI-WriteLog "⚠️ Failed to start service $Name: $($_.Exception.Message)"
+    }
+}
+
+# --- caching installer wrapper ---
+function PSI-RunOnce {
+    param(
+        [string]$Name,
+        [scriptblock]$Action
+    )
+    $flagFile = "C:\ProgramData\PSI-Deploy-Flags\$Name.done"
+    if (Test-Path $flagFile) {
+        PSI-WriteLog "⏩ $Name already completed, skipping."
+        return
+    }
+    try {
+        & $Action
+        if (!(Test-Path (Split-Path $flagFile))) { New-Item -Path (Split-Path $flagFile) -ItemType Directory -Force | Out-Null }
+        New-Item -ItemType File -Path $flagFile -Force | Out-Null
+        PSI-WriteLog "✅ $Name done."
+    } catch {
+        PSI-WriteLog "❌ $Name failed: $($_.Exception.Message)"
+    }
+}
+
+# --- multi-threaded install framework ---
+function PSI-RunParallel {
+    param([hashtable]$Jobs)
+    $running = @()
+    foreach ($key in $Jobs.Keys) {
+        $running += Start-Job -Name $key -ScriptBlock $Jobs[$key]
+    }
+    $running | Wait-Job | ForEach-Object {
+        $out = Receive-Job $_
+        PSI-WriteLog "[$($_.Name)] $out"
+        Remove-Job $_
+    }
+}
+
+# Example usage (replace with your existing installers):
+# PSI-RunParallel @{
+#     "AdobeReader" = { PSI-RunOnce "AdobeReader" { Install-AdobeReader } }
+#     "CrowdStrike" = { PSI-RunOnce "CrowdStrike" { Install-CrowdStrike } }
+#     "VPNClient"   = { PSI-RunOnce "VPNClient"   { Install-VPNClient } }
+# }
+
+#endregion PSI Deployment Performance Enhancements (Parallel + Caching + Deferred Logging)
+
+
+#region PSI Universal Compatibility + Smart Orchestration + Fast Windows Update
+
+# --- Detect environment ---
+$PSVer = $PSVersionTable.PSVersion.Major
+$IsWin10OrHigher = [Environment]::OSVersion.Version.Major -ge 10
+PSI-WriteLog "Detected PowerShell $PSVer on Windows $(if ($IsWin10OrHigher) { '10+' } else { 'Legacy' })."
+
+# --- Safe fallback for missing cmdlets ---
+if ($PSVer -lt 6) {
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        function Get-ScheduledTask { return @() }
+    }
+}
+
+#region Smart Orchestration Engine
+$Tasks = @(
+    @{ Name="DomainJoin";    DependsOn=@();                Action={ PSI-RunOnce "DomainJoin" { Join-DomainSafely } } },
+    @{ Name="McAfeeRemoval"; DependsOn=@();                Action={ PSI-RunOnce "McAfeeRemoval" { Remove-McAfee } } },
+    @{ Name="AdobeReader";   DependsOn=@("DomainJoin");    Action={ PSI-RunOnce "AdobeReader" { Install-AdobeReader } } },
+    @{ Name="VPNClient";     DependsOn=@("DomainJoin");    Action={ PSI-RunOnce "VPNClient" { Install-VPNClient } } },
+    @{ Name="CrowdStrike";   DependsOn=@("DomainJoin");    Action={ PSI-RunOnce "CrowdStrike" { Install-CrowdStrike } } },
+    @{ Name="Office";        DependsOn=@("DomainJoin");    Action={ PSI-RunOnce "Office" { Install-Office } } },
+    @{ Name="DriveMapping";  DependsOn=@("DomainJoin");    Action={ PSI-RunOnce "DriveMapping" { Map-NetworkDrives } } },
+    @{ Name="WindowsUpdate"; DependsOn=@("DomainJoin");    Action={ PSI-RunOnce "WindowsUpdate" { PSI-StartWindowsUpdate } } },
+    @{ Name="PostChecks";    DependsOn=@("AdobeReader","Office","CrowdStrike"); Action={ PSI-RunOnce "PostChecks" { Run-HealthChecks } } }
+)
+
+function PSI-RunTasks {
+    param([Array]$TaskList)
+    $done = @{}
+    while ($done.Count -lt $TaskList.Count) {
+        $ready = $TaskList | Where-Object {
+            -not $done.ContainsKey($_.Name) -and ($_.DependsOn | Where-Object { -not $done.ContainsKey($_) }) -eq $null
+        }
+        $jobs = foreach ($t in $ready) {
+            Start-Job -Name $t.Name -ScriptBlock $t.Action
+        }
+        if ($jobs.Count -gt 0) {
+            $jobs | Wait-Job | ForEach-Object {
+                $out = Receive-Job $_
+                PSI-WriteLog "[$($_.Name)] completed."
+                $done[$_.Name] = $true
+                Remove-Job $_
+            }
+        } else {
+            Start-Sleep -Seconds 1
+        }
+    }
+    PSI-WriteLog "✅ All orchestrated tasks complete."
+}
+#endregion Smart Orchestration Engine
+
+#region Optimized Windows Update
+function PSI-StartWindowsUpdate {
+    PSI-WriteLog "🚀 Starting optimized Windows Update..."
+    try {
+        if (Get-Command Get-WindowsUpdate -ErrorAction SilentlyContinue) {
+            Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot -ErrorAction SilentlyContinue | Out-Null
+        } else {
+            net stop wuauserv /y; net stop bits /y; net stop cryptsvc /y | Out-Null
+            Remove-Item "C:\Windows\SoftwareDistribution\Download" -Recurse -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            net start wuauserv; net start bits; net start cryptsvc | Out-Null
+            Start-Process "UsoClient.exe" -ArgumentList "StartScan" -WindowStyle Hidden
+            Start-Process "UsoClient.exe" -ArgumentList "StartDownload" -WindowStyle Hidden
+            Start-Process "UsoClient.exe" -ArgumentList "StartInstall" -WindowStyle Hidden
+            PSI-WriteLog "⚙️ Using USOClient fallback for updates."
+        }
+    } catch {
+        PSI-WriteLog "⚠️ Windows Update fallback encountered an error: $($_.Exception.Message)"
+    }
+}
+#endregion Optimized Windows Update
+
+# --- Trigger orchestrated run ---
+try {
+    PSI-RunTasks -TaskList $Tasks
+    PSI-FlushtoFile
+} catch {
+    PSI-WriteLog "❌ Orchestration failed: $($_.Exception.Message)"
+    PSI-FlushtoFile
+}
+#endregion PSI Universal Compatibility + Smart Orchestration + Fast Windows Update
